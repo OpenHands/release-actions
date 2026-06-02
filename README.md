@@ -50,13 +50,14 @@ can be centralized. They're small and stable, though.
    jobs:
      release-please:
        permissions: { contents: write, pull-requests: write }
+       secrets: inherit   # passes RELEASE_APP_ID / RELEASE_APP_PRIVATE_KEY through
        uses: OpenHands/release-actions/.github/workflows/release-please.yml@v1
    ```
    ```yaml
    # .github/workflows/pr.yml
    on:
      pull_request:
-       types: [opened, edited, reopened]
+       types: [opened, edited, reopened, synchronize]
    jobs:
      pr-title:
        permissions: { pull-requests: write }
@@ -67,7 +68,14 @@ can be centralized. They're small and stable, though.
 2. **Add the four state files.** Copy `.github/release.yml`, `release-please-config.json`,
    `.release-please-manifest.json` (seed `{ ".": "0.0.0" }`), and `version.txt` (`0.0.0`).
 
-3. **Apply the one-time repo settings** (these can't be imported):
+3. **Make sure the release App is available.** The reusable release workflow authors its PR
+   and tag with a GitHub App token (so CI runs on the release PR — see
+   [Why an App token](#why-an-app-token)). It's required, not optional: there's no
+   `GITHUB_TOKEN` fallback. Install the org's release App on the repo and expose
+   `RELEASE_APP_ID` / `RELEASE_APP_PRIVATE_KEY` (org-level secrets scoped to the repo are
+   simplest); `secrets: inherit` in the caller passes them through.
+
+4. **Apply the one-time repo settings** (these can't be imported):
    ```sh
    # Squash-merge so the PR title becomes the commit release-please reads.
    gh api -X PATCH repos/<owner>/<repo> \
@@ -80,6 +88,21 @@ can be centralized. They're small and stable, though.
    ```
 
 That's it — the next push to `main` opens a release PR.
+
+## Why an App token
+
+release-please opens its release PR (and later creates the tag) from automation. If it used
+the default `GITHUB_TOKEN`, GitHub's recursion guard would suppress the events that token
+creates — so **no workflow runs on the release PR**, and any tag-triggered publish job never
+fires. A required "CI must pass" rule on `main` would then block the release PR forever,
+because the required check never reports.
+
+Authoring those actions with a **GitHub App token** sidesteps the guard: App-created events
+trigger workflows normally, so the PR-title check runs on the release PR (its
+`chore(main): release …` title passes) and satisfies the required check. This is the one
+supported path — the reusable workflow has no `GITHUB_TOKEN` fallback, so behavior is the same
+everywhere it's used. A fine-grained PAT works too, but an App isn't tied to a person and
+doesn't expire, which matters when many repos share this flow.
 
 ## Release flow
 

@@ -20,4 +20,7 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    # Pass the org secrets (RELEASE_APP_ID / RELEASE_APP_PRIVATE_KEY) through to
+    # the reusable workflow so it can mint the GitHub App token.
+    secrets: inherit
     uses: ./.github/workflows/release-please.yml

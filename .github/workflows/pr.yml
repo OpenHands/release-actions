@@ -5,7 +5,10 @@ name: pr
 # this repo by tag instead of the local `./` path.
 on:
   pull_request:
-    types: [opened, edited, reopened]
+    # synchronize is needed alongside the title events: required status checks
+    # attach to a head SHA, and release-please force-pushes new commits to its
+    # release PR, so the lint must re-run on each update to stay green.
+    types: [opened, edited, reopened, synchronize]
 
 jobs:
   pr-title:

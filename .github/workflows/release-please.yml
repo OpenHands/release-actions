@@ -28,13 +28,26 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
+      # release-please authors its PR and tag with a GitHub App token (passed by
+      # the caller via `secrets: inherit`). This is the one supported path, not an
+      # option: events created by the default GITHUB_TOKEN are suppressed by
+      # GitHub's recursion guard, so required CI would never run on the release PR
+      # (and tag-triggered publish jobs would never fire). If RELEASE_APP_ID /
+      # RELEASE_APP_PRIVATE_KEY are missing, this step fails the run by design —
+      # there is no GITHUB_TOKEN fallback to avoid divergent behavior.
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - uses: googleapis/release-please-action@v4
         id: release
         with:
           # Manifest mode: reads release-please-config.json and
           # .release-please-manifest.json from the repo root by default.
-          # GITHUB_TOKEN is available to reusable workflows automatically.
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           # Release against whichever branch triggered the caller. On main this is
           # just "main" (the default); on a release/** branch it scopes the
           # release to that maintenance line so a hotfix ships only its fix.
@@ -50,6 +63,9 @@ jobs:
           TAG: ${{ steps.release.outputs.tag_name }}
           VERSION: ${{ steps.release.outputs.version }}
         with:
+          # Same App token as release-please, so labels/comments come from one
+          # identity and use one permission set.
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const tag = process.env.TAG;          // e.g. v0.1.1
             const version = process.env.VERSION;  // e.g. 0.1.1
