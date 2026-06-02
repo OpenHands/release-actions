@@ -1,0 +1,109 @@
+name: release-please (reusable)
+
+# Reusable workflow: runs release-please against whichever branch the CALLER was
+# triggered on, then back-labels every PR that shipped in a new release.
+#
+# It carries no `push:` trigger of its own — a reusable workflow can't. The
+# consumer repo owns the trigger in a thin caller workflow that does:
+#
+#   on:
+#     push:
+#       branches: [main, 'release/**']
+#   jobs:
+#     release-please:
+#       permissions: { contents: write, pull-requests: write }
+#       uses: OpenHands/release-actions/.github/workflows/release-please.yml@v1
+#
+# (This repo calls it via the local `./` path — see .github/workflows/release.yml.)
+on:
+  workflow_call:
+
+# Declared here as the cap; the caller job must also grant these or the token
+# can't be elevated to them (effective perms are the intersection of the two).
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          # Manifest mode: reads release-please-config.json and
+          # .release-please-manifest.json from the repo root by default.
+          # GITHUB_TOKEN is available to reusable workflows automatically.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Release against whichever branch triggered the caller. On main this is
+          # just "main" (the default); on a release/** branch it scopes the
+          # release to that maintenance line so a hotfix ships only its fix.
+          target-branch: ${{ github.ref_name }}
+
+      # When a release is cut, go back and tag every PR that shipped in it
+      # with a `released: <version>` label (and a short comment). This is not a
+      # release-please feature; we derive the included PRs from the commit range.
+      - name: Label included PRs with the release version
+        if: ${{ steps.release.outputs.release_created == 'true' }}
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ steps.release.outputs.tag_name }}
+          VERSION: ${{ steps.release.outputs.version }}
+        with:
+          script: |
+            const tag = process.env.TAG;          // e.g. v0.1.1
+            const version = process.env.VERSION;  // e.g. 0.1.1
+            const { owner, repo } = context.repo;
+            const label = `released: ${version}`;
+            const tagUrl = `https://github.com/${owner}/${repo}/releases/tag/${tag}`;
+
+            // 1. Find the previous release tag (releases come back newest-first;
+            //    the release we just created is at index 0).
+            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
+            const idx = releases.findIndex(r => r.tag_name === tag);
+            const prevTag = (idx >= 0 && releases[idx + 1]) ? releases[idx + 1].tag_name : null;
+
+            // 2. Gather the commits that landed in this release.
+            let commits;
+            if (prevTag) {
+              // compare returns up to 250 commits; ample for this project.
+              const cmp = await github.rest.repos.compareCommitsWithBasehead({
+                owner, repo, basehead: `${prevTag}...${tag}`,
+              });
+              commits = cmp.data.commits;
+            } else {
+              // First release: everything reachable from the tag.
+              commits = await github.paginate(github.rest.repos.listCommits, { owner, repo, sha: tag, per_page: 100 });
+            }
+
+            // 3. Map those commits to the merged PRs that introduced them.
+            const prNumbers = new Set();
+            for (const c of commits) {
+              const assoc = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: c.sha });
+              for (const pr of assoc.data) {
+                if (pr.merged_at) prNumbers.add(pr.number);
+              }
+            }
+
+            // 4. Ensure the version label exists (create on first use).
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: label });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({ owner, repo, name: label, color: '1D76DB', description: `Shipped in ${tag}` });
+              } else { throw e; }
+            }
+
+            // 5. Tag each included PR, skipping release-please's own release PR.
+            let tagged = 0;
+            for (const number of prNumbers) {
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+              const isReleasePR = pr.head.ref.startsWith('release-please--') ||
+                                  pr.labels.some(l => l.name.startsWith('autorelease:'));
+              if (isReleasePR) continue;
+              await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [label] });
+              await github.rest.issues.createComment({ owner, repo, issue_number: number, body: `🚀 Released in [${tag}](${tagUrl}).` });
+              core.info(`Tagged PR #${number} with "${label}".`);
+              tagged++;
+            }
+            core.info(`Tagged ${tagged} PR(s) as shipped in ${tag}.`);

@@ -1,0 +1,105 @@
+name: pr-title (reusable)
+
+# Reusable workflow: lints a PR title for Conventional Commits format and applies
+# a matching `type: <type>` label (which drives release-notes grouping via
+# .github/release.yml).
+#
+# Carries no `pull_request:` trigger of its own. The consumer repo owns it in a
+# thin caller workflow:
+#
+#   on:
+#     pull_request:
+#       types: [opened, edited, reopened]
+#   jobs:
+#     pr-title:
+#       permissions: { pull-requests: write }
+#       uses: OpenHands/release-actions/.github/workflows/pr-title.yml@v1
+#
+# (This repo calls it via the local `./` path — see .github/workflows/pr.yml.)
+on:
+  workflow_call:
+
+# Cap for the called token; the caller job must also grant pull-requests: write.
+permissions:
+  pull-requests: write
+
+jobs:
+  lint:
+    name: Lint PR title (conventional)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            perf
+            docs
+            chore
+            build
+            ci
+            refactor
+            style
+            test
+            revert
+
+  label:
+    name: Apply conventional-type label
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const TYPE_LABELS = {
+              feat:     { color: '0E8A16', description: 'A new feature' },
+              fix:      { color: 'D73A4A', description: 'A bug fix' },
+              perf:     { color: '5319E7', description: 'A performance improvement' },
+              docs:     { color: '0075CA', description: 'Documentation only changes' },
+              chore:    { color: 'FEF2C0', description: 'Maintenance / chores' },
+              build:    { color: 'C2E0C6', description: 'Build system or dependencies' },
+              ci:       { color: 'BFDADC', description: 'CI configuration changes' },
+              refactor: { color: 'FBCA04', description: 'Code refactoring' },
+              style:    { color: 'CCCCCC', description: 'Formatting / style only' },
+              test:     { color: 'D4C5F9', description: 'Adding or fixing tests' },
+              revert:   { color: 'E99695', description: 'Reverts a previous commit' },
+            };
+
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const number = pr.number;
+
+            // Parse the conventional type: type, optional (scope), optional !, then ':'
+            const match = pr.title.match(/^(\w+)(?:\([^)]*\))?(!)?:/);
+            if (!match) { core.setFailed(`PR title not conventional: "${pr.title}"`); return; }
+            const type = match[1].toLowerCase();
+            if (!TYPE_LABELS[type]) { core.setFailed(`Unknown type "${type}"`); return; }
+            const desired = `type: ${type}`;
+
+            // Ensure the label exists (create on first use).
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: desired });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({
+                  owner, repo, name: desired,
+                  color: TYPE_LABELS[type].color,
+                  description: TYPE_LABELS[type].description,
+                });
+              } else { throw e; }
+            }
+
+            // Swap out any stale managed type-labels (handles edited titles).
+            const managed = new Set(Object.keys(TYPE_LABELS).map(t => `type: ${t}`));
+            const current = await github.rest.issues.listLabelsOnIssue({ owner, repo, issue_number: number });
+            for (const label of current.data) {
+              if (managed.has(label.name) && label.name !== desired) {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number: number, name: label.name });
+              }
+            }
+
+            // Apply the current type label (idempotent).
+            await github.rest.issues.addLabels({ owner, repo, issue_number: number, labels: [desired] });
+            core.info(`Applied "${desired}" to PR #${number}.`);

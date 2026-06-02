@@ -1,0 +1,14 @@
+name: pr
+
+# Caller workflow: dogfoods this repo's own reusable PR-title workflow.
+# A consumer repo would have an identical file, but with `uses:` pointing at
+# this repo by tag instead of the local `./` path.
+on:
+  pull_request:
+    types: [opened, edited, reopened]
+
+jobs:
+  pr-title:
+    permissions:
+      pull-requests: write
+    uses: ./.github/workflows/pr-title.yml

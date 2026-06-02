@@ -1,0 +1,23 @@
+name: release
+
+# Caller workflow: this repo dogfoods its own reusable release workflow.
+# It owns the trigger; the reusable workflow owns the logic. A consumer repo
+# would have an identical file, but with `uses:` pointing at this repo by tag
+# (e.g. OpenHands/release-actions/.github/workflows/release-please.yml@v1)
+# instead of the local `./` path.
+on:
+  push:
+    branches:
+      - main
+      # Maintenance/freeze branches (e.g. release/0.2). The reusable workflow
+      # scopes the release to whichever branch triggered this run.
+      - 'release/**'
+
+jobs:
+  release-please:
+    # The caller must grant the permissions the reusable workflow needs; the
+    # effective token is the intersection of the two.
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: ./.github/workflows/release-please.yml
