@@ -4,16 +4,28 @@ name: pr-title (reusable)
 # a matching `type: <type>` label (which drives release-notes grouping via
 # .github/release.yml).
 #
-# Carries no `pull_request:` trigger of its own. The consumer repo owns it in a
-# thin caller workflow:
+# SECURITY MODEL — this is designed to run under pull_request_target (so it
+# works on PRs from forks / non-members), which means it executes with a
+# writable token in the base repo's context. It stays safe because:
+#   * It NEVER checks out or runs any code from the PR. It only reads the PR
+#     title out of the event payload — so fork code never runs here.
+#   * It uses ONLY the default GITHUB_TOKEN, never the release App token. The
+#     caller must NOT pass `secrets: inherit`, so the App credentials are not
+#     even in scope. Both steps below pin the token to secrets.GITHUB_TOKEN.
+#   * The title is read as runtime data (context.payload), never interpolated
+#     into the script as an Actions expression, so a crafted title can't inject.
+#
+# Carries no trigger of its own. The consumer repo owns it in a thin caller
+# workflow:
 #
 #   on:
-#     pull_request:
+#     pull_request_target:
 #       types: [opened, edited, reopened]
 #   jobs:
 #     pr-title:
 #       permissions: { pull-requests: write }
-#       uses: OpenHands/release-actions/.github/workflows/pr-title.yml@v1
+#       # do NOT add `secrets: inherit` — keep the App token out of scope
+#       uses: OpenHands/release-actions/.github/workflows/pr-title.yml@main
 #
 # (This repo calls it via the local `./` path — see .github/workflows/pr.yml.)
 on:
@@ -28,6 +40,9 @@ jobs:
     name: Lint PR title (conventional)
     runs-on: ubuntu-latest
     steps:
+      # GITHUB_TOKEN only — never the App token. This action reads the title
+      # from the event payload and needs no checkout, so it's safe under
+      # pull_request_target.
       - uses: amannn/action-semantic-pull-request@48f256284bd46cdaab1048c3721360e808335d50 # v6.1.1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -52,6 +67,10 @@ jobs:
     steps:
       - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         with:
+          # GITHUB_TOKEN only — pinned explicitly so this can never silently
+          # pick up the release App token, even if a caller later (wrongly)
+          # added `secrets: inherit`.
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
             const TYPE_LABELS = {
               feat:     { color: '0E8A16', description: 'A new feature' },
@@ -71,11 +90,23 @@ jobs:
             const { owner, repo } = context.repo;
             const number = pr.number;
 
-            // Parse the conventional type: type, optional (scope), optional !, then ':'
-            const match = pr.title.match(/^(\w+)(?:\([^)]*\))?(!)?:/);
-            if (!match) { core.setFailed(`PR title not conventional: "${pr.title}"`); return; }
+            // SAFETY: the title is read here as plain runtime data from the event
+            // payload — it is NEVER interpolated into this script as an Actions
+            // expression, so it cannot inject code, even under pull_request_target.
+            // Treat it as hostile input and validate strictly before any API call.
+            const title = typeof pr.title === 'string' ? pr.title : '';
+
+            // Parse the conventional type from the FRONT of the title only:
+            // <type>, optional (scope), optional !, then ':'. \w+ admits no shell
+            // or JS metacharacters, and the captured type must then be an OWN key
+            // of the allowlist below — so nothing attacker-controlled (including
+            // prototype keys like "__proto__"/"constructor") reaches a label name.
+            const match = title.match(/^(\w+)(?:\([^)]*\))?(!)?:/);
+            if (!match) { core.setFailed(`PR title not conventional: "${title}"`); return; }
             const type = match[1].toLowerCase();
-            if (!TYPE_LABELS[type]) { core.setFailed(`Unknown type "${type}"`); return; }
+            if (!Object.prototype.hasOwnProperty.call(TYPE_LABELS, type)) {
+              core.setFailed(`Unknown type "${type}"`); return;
+            }
             const desired = `type: ${type}`;
 
             // Ensure the label exists (create on first use).
