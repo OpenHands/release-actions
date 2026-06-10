@@ -17,6 +17,22 @@ name: release-please (reusable)
 # (This repo calls it via the local `./` path — see .github/workflows/release.yml.)
 on:
   workflow_call:
+    inputs:
+      config-file:
+        description: >-
+          Path to the release-please config file. Override it when a repo runs
+          this workflow more than once — one independent release line per
+          artifact (each line needs its own config + manifest pair).
+        required: false
+        type: string
+        default: release-please-config.json
+      manifest-file:
+        description: >-
+          Path to the release-please manifest file. Pair a distinct manifest
+          with each config-file so every release line tracks its own version.
+        required: false
+        type: string
+        default: .release-please-manifest.json
 
 # Declared here as the cap; the caller job must also grant these or the token
 # can't be elevated to them (effective perms are the intersection of the two).
@@ -45,9 +61,12 @@ jobs:
       - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         id: release
         with:
-          # Manifest mode: reads release-please-config.json and
-          # .release-please-manifest.json from the repo root by default.
           token: ${{ steps.app-token.outputs.token }}
+          # Manifest mode. Defaults to release-please-config.json /
+          # .release-please-manifest.json at the repo root; a caller can point at
+          # other files to run a second, independent release line from one repo.
+          config-file: ${{ inputs.config-file }}
+          manifest-file: ${{ inputs.manifest-file }}
           # Release against whichever branch triggered the caller. On main this is
           # just "main" (the default); on a release/** branch it scopes the
           # release to that maintenance line so a hotfix ships only its fix.
@@ -61,16 +80,17 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           TAG: ${{ steps.release.outputs.tag_name }}
-          VERSION: ${{ steps.release.outputs.version }}
         with:
           # Same App token as release-please, so labels/comments come from one
           # identity and use one permission set.
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const tag = process.env.TAG;          // e.g. v0.1.1
-            const version = process.env.VERSION;  // e.g. 0.1.1
+            const tag = process.env.TAG;          // e.g. v0.1.1, or cloud-1.37.3
             const { owner, repo } = context.repo;
-            const label = `released: ${version}`;
+            // Label off the TAG, not the bare version. A repo can run this
+            // workflow for more than one release line (e.g. `1.7.3` and
+            // `cloud-1.37.3`): their versions can collide, their tags cannot.
+            const label = `released: ${tag}`;
             const tagUrl = `https://github.com/${owner}/${repo}/releases/tag/${tag}`;
 
             // 1. Find the previous release tag (releases come back newest-first;
