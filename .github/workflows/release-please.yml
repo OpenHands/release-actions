@@ -44,6 +44,15 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
+      # Full history + tags so the back-labeling step can resolve the PREVIOUS
+      # release tag by ancestry (git describe). The release commit itself is
+      # already on the branch that triggered this run; we only need the depth
+      # and the existing tags — not the brand-new tag, which we never rely on.
+      - name: Check out full history (for previous-tag lookup)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
       # release-please authors its PR and tag with a GitHub App token (passed by
       # the caller via `secrets: inherit`). This is the one supported path, not an
       # option: events created by the default GITHUB_TOKEN are suppressed by
@@ -72,20 +81,27 @@ jobs:
           # release to that maintenance line so a hotfix ships only its fix.
           target-branch: ${{ github.ref_name }}
 
-      # When a release is cut, go back and tag every PR that shipped in it
-      # with a `released: <version>` label (and a short comment). This is not a
-      # release-please feature; we derive the included PRs from the commit range.
+      # When a release is cut, go back and tag every PR that shipped in it with a
+      # `released: <tag>` label (and a short comment). Not a release-please
+      # feature: we derive the included PRs from the commit range
+      # `<previous tag>..<release commit>`, where the previous tag is found by git
+      # ancestry. If there is NO previous tag we label nothing — we never walk the
+      # whole history (doing so once mass-labeled every PR ever merged).
       - name: Label included PRs with the release version
         if: ${{ steps.release.outputs.release_created == 'true' }}
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           TAG: ${{ steps.release.outputs.tag_name }}
+          VERSION: ${{ steps.release.outputs.version }}
+          SHA: ${{ steps.release.outputs.sha }}
         with:
           # Same App token as release-please, so labels/comments come from one
           # identity and use one permission set.
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const tag = process.env.TAG;          // e.g. v0.1.1, or cloud-1.37.3
+            const version = process.env.VERSION;  // e.g. 0.1.1, or 1.37.3
+            const sha = process.env.SHA;          // commit the release was tagged at
             const { owner, repo } = context.repo;
             // Label off the TAG, not the bare version. A repo can run this
             // workflow for more than one release line (e.g. `1.7.3` and
@@ -93,29 +109,55 @@ jobs:
             const label = `released: ${tag}`;
             const tagUrl = `https://github.com/${owner}/${repo}/releases/tag/${tag}`;
 
-            // 1. Find the previous release tag (releases come back newest-first;
-            //    the release we just created is at index 0).
-            const releases = await github.paginate(github.rest.repos.listReleases, { owner, repo, per_page: 100 });
-            const idx = releases.findIndex(r => r.tag_name === tag);
-            const prevTag = (idx >= 0 && releases[idx + 1]) ? releases[idx + 1].tag_name : null;
+            // The tag prefix for THIS release line (e.g. "v" or "cloud-"), derived
+            // by stripping the version off the tag. Used to scope the previous-tag
+            // lookup to the same line, so a `cloud-*` release does not pick a
+            // `v*` tag (or vice versa) as its base.
+            const prefix = (version && tag.endsWith(version)) ? tag.slice(0, -version.length) : '';
 
-            // 2. Gather the commits that landed in this release.
-            let commits;
-            if (prevTag) {
-              // compare returns up to 250 commits; ample for this project.
-              const cmp = await github.rest.repos.compareCommitsWithBasehead({
-                owner, repo, basehead: `${prevTag}...${tag}`,
-              });
-              commits = cmp.data.commits;
-            } else {
-              // First release: everything reachable from the tag.
-              commits = await github.paginate(github.rest.repos.listCommits, { owner, repo, sha: tag, per_page: 100 });
+            // 1. Find the previous release tag by ANCESTRY: the most recent tag
+            //    reachable from the release commit's first parent. We deliberately
+            //    do NOT consult the releases API. That endpoint orders releases by
+            //    creation time, which is wrong twice over:
+            //      (a) it may not yet include the release we just cut (read-after-
+            //          write lag) — the lookup then misfired as "first release ever"
+            //          and mass-labeled the entire history; and
+            //      (b) it is wrong for patches — a hotfix on a maintenance branch is
+            //          newer by date, but its true predecessor is its branch
+            //          ancestor, not whatever shipped most recently on main.
+            //    git ancestry is immune to both: no network read of our own write,
+            //    and it follows real history.
+            const describeArgs = ['describe', '--tags', '--abbrev=0'];
+            if (prefix) describeArgs.push('--match', `${prefix}*`);
+            describeArgs.push(`${sha}^`);
+            const describe = await exec.getExecOutput('git', describeArgs, { ignoreReturnCode: true, silent: true });
+            const prevTag = describe.exitCode === 0 ? describe.stdout.trim() : '';
+
+            // 2. No ancestor tag ⇒ STOP. We never fall back to walking the whole
+            //    history: that labels every PR ever merged (the original bug). A
+            //    genuine first-ever release is left unlabeled by design — label its
+            //    PRs by hand if you want them — because we cannot distinguish
+            //    "first release" from "tags missing / lookup failed", and only one
+            //    of those is safe to act on.
+            if (!prevTag) {
+              core.warning(
+                `No ancestor tag found for ${tag} (searched ${prefix ? `'${prefix}*'` : 'all tags'} from ${sha}^). ` +
+                `Skipping back-labeling — refusing to label the entire history. ` +
+                `If this is genuinely the first release, label its PRs manually.`,
+              );
+              return;
             }
+            core.info(`Previous release tag (by ancestry): ${prevTag}`);
+
+            // The commits in this release are exactly `${prevTag}..${sha}`:
+            // reachable from the release commit, not from the previous tag.
+            const revList = await exec.getExecOutput('git', ['rev-list', `${prevTag}..${sha}`], { silent: true });
+            const shas = revList.stdout.split('\n').map(s => s.trim()).filter(Boolean);
 
             // 3. Map those commits to the merged PRs that introduced them.
             const prNumbers = new Set();
-            for (const c of commits) {
-              const assoc = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: c.sha });
+            for (const commit_sha of shas) {
+              const assoc = await github.rest.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha });
               for (const pr of assoc.data) {
                 if (pr.merged_at) prNumbers.add(pr.number);
               }
