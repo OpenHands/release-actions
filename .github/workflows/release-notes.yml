@@ -1,0 +1,184 @@
+name: release-notes (reusable)
+
+# Reusable workflow: rewrites a published GitHub Release's body with GitHub-style
+# notes SCOPED to a path — for monorepos where one repo ships several
+# independently-released packages (e.g. one Helm chart per directory).
+#
+# Why this exists: GitHub's own generate-notes API produces the nice
+# `## What's Changed` / `* <title> by @author in <PR>` / `## New Contributors` /
+# `**Full Changelog**` format and groups entries by label via .github/release.yml
+# — but it has NO path filter, so over a monorepo's tag-to-tag range it lists
+# EVERY package's PRs intermingled. release-please's per-path `default` changelog
+# scopes correctly but doesn't look like GitHub's notes.
+#
+# So we get the best of both: ask GitHub to generate the notes for the tag range
+# (its exact format + label sections), then DROP every entry whose PR didn't
+# touch `paths`, removing any section that empties out. We only ever remove lines
+# GitHub emitted; we never reconstruct them, so the surviving notes are
+# byte-for-byte GitHub's format.
+#
+# Caller (one matrix-free job per release tag — keep it OUT of the chart-publish
+# workflow so a missing copy of THIS file can't block publishing):
+#
+#   on: { push: { tags: ['mychart-v*'] } }
+#   jobs:
+#     notes:
+#       permissions: { contents: write, pull-requests: read }
+#       uses: OpenHands/release-actions/.github/workflows/release-notes.yml@main
+#       with:
+#         tag: ${{ github.ref_name }}
+#         paths: charts/mychart/
+#         tag-match: mychart-v*
+#
+# Uses only the default GITHUB_TOKEN (it edits a release and reads PRs in the
+# SAME repo) — no App token, so the caller must NOT pass `secrets: inherit`.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag whose notes to rewrite (e.g. mychart-v1.2.3). Defaults to the ref that triggered the caller.'
+        required: false
+        default: ${{ github.ref_name }}
+        type: string
+      paths:
+        description: >-
+          Newline- or comma-separated path prefixes. An entry is kept only if its
+          PR changed a file under one of these (e.g. "charts/openhands/" — which
+          also covers embedded subcharts under charts/openhands/charts/**). Match
+          is a literal string prefix on each changed file path.
+        required: true
+        type: string
+      previous-tag:
+        description: >-
+          Previous release tag to diff from. If empty, it is resolved by git
+          ancestry using `tag-match`; if that finds nothing (first release of a
+          line), GitHub auto-detects the previous tag.
+        required: false
+        default: ''
+        type: string
+      tag-match:
+        description: >-
+          Glob passed to `git describe --match` to find the previous tag on THIS
+          release line (e.g. "mychart-v*"), so a sibling package's tag is never
+          picked as the base. Ignored when `previous-tag` is set.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history + tags so the previous-tag lookup (git describe) can resolve
+      # by ancestry, exactly like the back-labeling in release-please.yml.
+      - name: Check out full history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Render path-scoped GitHub-style notes and update the release
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          TAG: ${{ inputs.tag }}
+          PATHS: ${{ inputs.paths }}
+          PREV_TAG: ${{ inputs.previous-tag }}
+          TAG_MATCH: ${{ inputs.tag-match }}
+        with:
+          script: |
+            const tag = process.env.TAG;
+            const prefixes = (process.env.PATHS || '')
+              .split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+            const tagMatch = (process.env.TAG_MATCH || '').trim();
+            let prevTag = (process.env.PREV_TAG || '').trim();
+            const { owner, repo } = context.repo;
+            if (prefixes.length === 0) { core.setFailed('`paths` input is empty.'); return; }
+
+            // 1. Resolve the previous tag on THIS release line, if not provided.
+            //    git ancestry (not the releases API) so a sibling package's tag
+            //    is never chosen and there's no read-after-write lag.
+            if (!prevTag) {
+              const args = ['describe', '--tags', '--abbrev=0'];
+              if (tagMatch) args.push('--match', tagMatch);
+              args.push(`${tag}^`);
+              const r = await exec.getExecOutput('git', args, { ignoreReturnCode: true, silent: true });
+              prevTag = r.exitCode === 0 ? r.stdout.trim() : '';
+              core.info(prevTag
+                ? `Previous tag (by ancestry): ${prevTag}`
+                : `No ancestor ${tagMatch || 'tag'} for ${tag}; letting GitHub auto-detect (first release of this line?).`);
+            }
+
+            // 2. GitHub generates the notes for the range — its exact format,
+            //    label-based sections (.github/release.yml), author tags, New
+            //    Contributors and Full Changelog. Passing the line's own tags
+            //    makes the Full Changelog compare link correct for free.
+            const genParams = { owner, repo, tag_name: tag };
+            if (prevTag) genParams.previous_tag_name = prevTag;
+            const { data: gen } = await github.rest.repos.generateReleaseNotes(genParams);
+            const rawBody = gen.body || '';
+
+            // 3. Does a PR's diff touch any scoped prefix? (cached; paginated)
+            const PR_RE = /https:\/\/github\.com\/[^/\s)]+\/[^/\s)]+\/pull\/(\d+)/;
+            const cache = new Map();
+            async function prInScope(n) {
+              if (cache.has(n)) return cache.get(n);
+              let hit = false;
+              try {
+                const files = await github.paginate(github.rest.pulls.listFiles,
+                  { owner, repo, pull_number: n, per_page: 100 });
+                hit = files.some(f => prefixes.some(p => f.filename.startsWith(p)));
+              } catch (e) { core.warning(`listFiles #${n} failed: ${e.message}`); }
+              cache.set(n, hit);
+              return hit;
+            }
+
+            // 4. Filter the notes IN PLACE. Hold each `### Category` / `## New
+            //    Contributors` header until an in-scope entry appears beneath it,
+            //    so a section that loses all its entries vanishes header-and-all.
+            //    Every other line (config comment, blanks, "## What's Changed",
+            //    "**Full Changelog**") passes through untouched.
+            const out = [];
+            let pending = null;
+            for (const line of rawBody.split('\n')) {
+              if (line.startsWith('### ') || line.trim() === '## New Contributors') {
+                pending = line; continue;
+              }
+              if (line.startsWith('## ')) { pending = null; out.push(line); continue; }
+              if (line.startsWith('* ')) {
+                const m = line.match(PR_RE);
+                const keep = m ? await prInScope(parseInt(m[1], 10)) : true;
+                if (keep) { if (pending) { out.push(pending); pending = null; } out.push(line); }
+                continue;
+              }
+              out.push(line);
+            }
+            let body = out.join('\n')
+              .replace(/\n{3,}/g, '\n\n')   // dropping a section can leave a double separator
+              .replace(/^\n+/, '')
+              .replace(/\n+$/, '\n');
+
+            const kept = (body.match(/^\* .*\/pull\/\d+/gm) || []).length;
+            if (kept === 0) {
+              // A real release of this line should always have ≥1 scoped PR; guard anyway.
+              body = `## What's Changed\n\n_No changes under ${prefixes.join(', ')} in this release._\n`;
+              core.warning(`No in-scope entries for ${tag} under ${prefixes.join(', ')}.`);
+            }
+
+            // 5. Replace the release body. The release is created together with
+            //    the tag, but can lag the tag-push event by a beat — so retry.
+            let release = null;
+            for (let i = 0; i < 6 && !release; i++) {
+              try {
+                release = (await github.rest.repos.getReleaseByTag({ owner, repo, tag })).data;
+              } catch (e) {
+                if (e.status !== 404) throw e;
+                core.info(`Release for ${tag} not visible yet (attempt ${i + 1}/6); waiting 5s…`);
+                await new Promise(r => setTimeout(r, 5000));
+              }
+            }
+            if (!release) { core.setFailed(`No GitHub Release found for tag ${tag}.`); return; }
+            await github.rest.repos.updateRelease({ owner, repo, release_id: release.id, body });
+            core.info(`Updated release ${tag}: ${kept} scoped entr${kept === 1 ? 'y' : 'ies'}.`);
