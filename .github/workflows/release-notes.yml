@@ -1,0 +1,277 @@
+name: release-notes (reusable)
+
+# Reusable workflow: rewrites a published GitHub Release's body with GitHub-style
+# notes SCOPED to a path — for monorepos where one repo ships several
+# independently-released packages (e.g. one Helm chart per directory).
+#
+# This is the HAND-ROLLED variant. Rather than ask GitHub's generate-notes API
+# for the notes and trim them (the sibling approach), it builds the notes from
+# primitives: enumerate the commits in the tag range, map each to its merged
+# PR(s), keep only PRs that touched `paths`, categorize by PR label using the
+# mapping below, and render the markdown by hand. Same final shape as GitHub's
+# notes (## What's Changed / `* <title> by @author in <PR>` / ### category
+# sections / ## New Contributors / **Full Changelog**) — but we own every line,
+# which is the whole point: full control over formatting and categorization.
+#
+# Why hand-rolled at all: GitHub's generate-notes has NO path filter, so over a
+# monorepo's tag-to-tag range it lists EVERY package's PRs intermingled. Trimming
+# its output works but is at the mercy of its formatting; building the notes
+# ourselves lets us change the format freely (the label->category map here is
+# hardcoded — that IS the tradeoff — and mirrors the consumer's .github/release.yml).
+#
+# The label->category mapping and the "flat list when no PR matched a named
+# category" behavior below are chosen to match GitHub's generate-notes output
+# byte-for-byte on the cases we ship, so this file is a drop-in A/B swap for the
+# trim-based variant (same filename, same inputs).
+#
+# Caller (one matrix-free job per release tag — keep it OUT of the chart-publish
+# workflow so a missing copy of THIS file can't block publishing):
+#
+#   on: { push: { tags: ['mychart-v*'] } }
+#   jobs:
+#     notes:
+#       permissions: { contents: write, pull-requests: read }
+#       uses: OpenHands/release-actions/.github/workflows/release-notes.yml@main
+#       with:
+#         tag: ${{ github.ref_name }}
+#         paths: charts/mychart/
+#         tag-match: mychart-v*
+#
+# Uses only the default GITHUB_TOKEN (it edits a release and reads PRs in the
+# SAME repo) — no App token, so the caller must NOT pass `secrets: inherit`.
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Release tag whose notes to rewrite (e.g. mychart-v1.2.3). Defaults to the ref that triggered the caller.'
+        required: false
+        default: ${{ github.ref_name }}
+        type: string
+      paths:
+        description: >-
+          Newline- or comma-separated path prefixes. An entry is kept only if its
+          PR changed a file under one of these (e.g. "charts/openhands/" — which
+          also covers embedded subcharts under charts/openhands/charts/**). Match
+          is a literal string prefix on each changed file path.
+        required: true
+        type: string
+      previous-tag:
+        description: >-
+          Previous release tag to diff from. If empty, it is resolved by git
+          ancestry using `tag-match`; if that finds nothing (first release of a
+          line), the range and Full Changelog are omitted and a minimal body is
+          emitted.
+        required: false
+        default: ''
+        type: string
+      tag-match:
+        description: >-
+          Glob passed to `git describe --match` to find the previous tag on THIS
+          release line (e.g. "mychart-v*"), so a sibling package's tag is never
+          picked as the base. Ignored when `previous-tag` is set.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: read
+
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    steps:
+      # Full history + tags so the previous-tag lookup (git describe) can resolve
+      # by ancestry, exactly like the back-labeling in release-please.yml.
+      - name: Check out full history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Build path-scoped GitHub-style notes and update the release
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          TAG: ${{ inputs.tag }}
+          PATHS: ${{ inputs.paths }}
+          PREV_TAG: ${{ inputs.previous-tag }}
+          TAG_MATCH: ${{ inputs.tag-match }}
+        with:
+          script: |
+            const tag = process.env.TAG;
+            const prefixes = (process.env.PATHS || '')
+              .split(/[\n,]/).map(s => s.trim()).filter(Boolean);
+            const tagMatch = (process.env.TAG_MATCH || '').trim();
+            let prevTag = (process.env.PREV_TAG || '').trim();
+            const { owner, repo } = context.repo;
+            if (prefixes.length === 0) { core.setFailed('`paths` input is empty.'); return; }
+
+            // Hardcoded label -> category mapping. First matching NAMED category
+            // wins, in order; `*` is the catch-all. Mirrors the consumer's
+            // .github/release.yml — hardcoding it is the hand-rolled tradeoff and
+            // gives us format control.
+            const CATEGORIES = [
+              { title: 'Features', labels: ['type: feat'] },
+              { title: 'Bug Fixes', labels: ['type: fix'] },
+              { title: 'Performance', labels: ['type: perf'] },
+              { title: 'Documentation', labels: ['type: docs'] },
+              { title: 'Maintenance', labels: ['type: chore', 'type: build', 'type: ci', 'type: refactor', 'type: style', 'type: test', 'type: revert'] },
+              { title: 'Other Changes', labels: ['*'] },
+            ];
+            const namedCategoryFor = (labelNames) => {
+              const set = new Set(labelNames);
+              for (const cat of CATEGORIES) {
+                if (cat.labels.includes('*')) continue;
+                if (cat.labels.some(l => set.has(l))) return cat.title;
+              }
+              return null;
+            };
+
+            // 1. Resolve the previous tag on THIS release line, if not provided.
+            //    git ancestry (not the releases API) so a sibling package's tag
+            //    is never chosen and there's no read-after-write lag.
+            if (!prevTag) {
+              const args = ['describe', '--tags', '--abbrev=0'];
+              if (tagMatch) args.push('--match', tagMatch);
+              args.push(`${tag}^`);
+              const r = await exec.getExecOutput('git', args, { ignoreReturnCode: true, silent: true });
+              prevTag = r.exitCode === 0 ? r.stdout.trim() : '';
+              core.info(prevTag
+                ? `Previous tag (by ancestry): ${prevTag}`
+                : `No ancestor ${tagMatch || 'tag'} for ${tag}; first release of this line — range and Full Changelog omitted.`);
+            }
+
+            // 2. Enumerate commits in the range, OLDEST-FIRST, via the compare
+            //    API (so we don't rely on local git for the commit list and the
+            //    workflow matches the validation harness 1:1). On the first
+            //    release of a line there's no prevTag, so there's no range to
+            //    walk — fall through to a minimal body. (compare returns at most
+            //    250 commits; per-chart ranges are far smaller.)
+            let commitShas = [];
+            if (prevTag) {
+              const cmp = await github.rest.repos.compareCommitsWithBasehead({
+                owner, repo, basehead: `${prevTag}...${tag}`,
+              });
+              commitShas = (cmp.data.commits || []).map(c => c.sha);
+            }
+
+            // 3. Map commits -> merged PRs, preserving first-seen (oldest-first)
+            //    order, deduped by number. The associated-PR objects already
+            //    carry number/title/html_url/user.login/labels, so no pulls.get.
+            // 4. Path filter: keep a PR iff any changed file is under a prefix.
+            const fileCache = new Map();
+            async function prInScope(n) {
+              if (fileCache.has(n)) return fileCache.get(n);
+              let hit = false;
+              try {
+                const files = await github.paginate(github.rest.pulls.listFiles,
+                  { owner, repo, pull_number: n, per_page: 100 });
+                hit = files.some(f => prefixes.some(p => f.filename.startsWith(p)));
+              } catch (e) { core.warning(`listFiles #${n} failed: ${e.message}`); }
+              fileCache.set(n, hit);
+              return hit;
+            }
+
+            const seen = new Set();
+            const keptPrs = [];
+            for (const sha of commitShas) {
+              let assoc = [];
+              try {
+                assoc = await github.paginate(
+                  github.rest.repos.listPullRequestsAssociatedWithCommit,
+                  { owner, repo, commit_sha: sha, per_page: 100 });
+              } catch (e) { core.warning(`assoc PRs for ${sha} failed: ${e.message}`); }
+              for (const pr of assoc) {
+                if (!pr.merged_at) continue;
+                if (seen.has(pr.number)) continue;
+                seen.add(pr.number);
+                if (!(await prInScope(pr.number))) continue;
+                keptPrs.push(pr);
+              }
+            }
+
+            // 6. New Contributors (repo-wide first contribution, GitHub's
+            //    definition): a kept-PR author whose EARLIEST merged PR in the
+            //    repo is itself one of this release's kept PRs. Order by first
+            //    appearance among kept PRs.
+            const keptNumbers = new Set(keptPrs.map(pr => pr.number));
+            const newContribLines = [];
+            const seenAuthors = new Set();
+            for (const pr of keptPrs) {
+              const login = pr.user.login;
+              if (seenAuthors.has(login)) continue;
+              seenAuthors.add(login);
+              let earliest = null;
+              try {
+                const res = await github.rest.search.issuesAndPullRequests({
+                  q: `repo:${owner}/${repo} is:pr is:merged author:${login}`,
+                  sort: 'created', order: 'asc', per_page: 1,
+                });
+                earliest = res.data.items.length ? res.data.items[0].number : null;
+              } catch (e) { core.warning(`first-contribution search for @${login} failed: ${e.message}`); }
+              if (earliest != null && keptNumbers.has(earliest)) {
+                const ePr = keptPrs.find(p => p.number === earliest);
+                newContribLines.push(`* @${login} made their first contribution in ${ePr.html_url}`);
+              }
+            }
+
+            // 7. Render. Assign kept PRs to named categories (or "unmatched").
+            //    GitHub only materializes `###` subheaders — including the `*`
+            //    "Other Changes" — when ≥1 PR matched a NAMED category; with
+            //    none, the notes are a FLAT list under "## What's Changed".
+            //    Reproducing that keeps us byte-identical to generate-notes.
+            //    Omit empty pieces. We intentionally do NOT emit GitHub's
+            //    "<!-- Release notes generated… -->" comment (we don't use that
+            //    config path) — a documented, deliberate difference.
+            const entryLine = (pr) => `* ${pr.title} by @${pr.user.login} in ${pr.html_url}`;
+            const named = new Map(CATEGORIES.map(c => [c.title, []]));
+            const unmatched = [];
+            for (const pr of keptPrs) {
+              const t = namedCategoryFor((pr.labels || []).map(l => l.name));
+              if (t) named.get(t).push(pr); else unmatched.push(pr);
+            }
+            const anyNamed = CATEGORIES.some(c => c.labels[0] !== '*' && named.get(c.title).length);
+
+            let body;
+            if (keptPrs.length === 0) {
+              // A real release of this line should always have ≥1 scoped PR; guard anyway.
+              body = `## What's Changed\n\n_No changes under ${prefixes.join(', ')} in this release._\n`;
+              core.warning(`No in-scope entries for ${tag} under ${prefixes.join(', ')}.`);
+            } else {
+              const lines = ["## What's Changed"];
+              if (!anyNamed) {
+                for (const pr of keptPrs) lines.push(entryLine(pr));
+              } else {
+                for (const cat of CATEGORIES) {
+                  const prs = cat.labels[0] === '*' ? unmatched : named.get(cat.title);
+                  if (!prs.length) continue;
+                  lines.push(`### ${cat.title}`);
+                  for (const pr of prs) lines.push(entryLine(pr));
+                }
+              }
+              if (newContribLines.length) {
+                lines.push('', '## New Contributors', ...newContribLines);
+              }
+              if (prevTag) {
+                lines.push('', `**Full Changelog**: https://github.com/${owner}/${repo}/compare/${prevTag}...${tag}`);
+              }
+              body = lines.join('\n') + '\n';
+            }
+
+            const kept = keptPrs.length;
+            core.info(`Built notes for ${tag}: ${kept} scoped entr${kept === 1 ? 'y' : 'ies'}.`);
+
+            // 8. Replace the release body. The release is created together with
+            //    the tag, but can lag the tag-push event by a beat — so retry.
+            let release = null;
+            for (let i = 0; i < 6 && !release; i++) {
+              try {
+                release = (await github.rest.repos.getReleaseByTag({ owner, repo, tag })).data;
+              } catch (e) {
+                if (e.status !== 404) throw e;
+                core.info(`Release for ${tag} not visible yet (attempt ${i + 1}/6); waiting 5s…`);
+                await new Promise(r => setTimeout(r, 5000));
+              }
+            }
+            if (!release) { core.setFailed(`No GitHub Release found for tag ${tag}.`); return; }
+            await github.rest.repos.updateRelease({ owner, repo, release_id: release.id, body });
+            core.info(`Updated release ${tag}: ${kept} scoped entr${kept === 1 ? 'y' : 'ies'}.`);
