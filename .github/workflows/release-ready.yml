@@ -1,0 +1,271 @@
+name: release ready (reusable)
+
+# Reusable workflow: call this from pull_request_target.ready_for_review so a
+# draft release PR becomes the explicit cut-a-release signal. Consumers provide
+# the product name and Slack channel; this workflow owns the safe release-please
+# PR detection, notification, and optional test triggers.
+#
+# SECURITY MODEL — this is designed to run under pull_request_target in the
+# consumer repo, which means it can run with inherited secrets, the release App
+# token, and caller-granted write permissions. It stays safe because:
+#   * It NEVER checks out or runs code from the PR. It only reads PR metadata
+#     from the event payload, so fork code never executes here.
+#   * It refuses fork PRs and requires an existing `autorelease:*` label. Branch
+#     names and titles are author-controlled under pull_request_target, so they
+#     must not be sufficient to trigger Slack or release-test dispatches.
+#   * It validates the release-please title shape before composing the Slack
+#     message and treats all PR metadata as runtime data, not script input.
+on:
+  workflow_call:
+    inputs:
+      product-name:
+        description: Product name to display in the Slack notification.
+        required: true
+        type: string
+      slack-channel:
+        description: Slack channel to notify, e.g. "#proj-agent-canvas".
+        required: true
+        type: string
+      release-test-workflows:
+        description: >-
+          Newline-separated workflow file names or workflow IDs to dispatch when
+          a release PR is marked ready for review. Each workflow must support
+          workflow_dispatch and must not require additional inputs.
+        required: false
+        type: string
+        default: ""
+      release-test-event-type:
+        description: >-
+          repository_dispatch event type emitted when a release PR is marked
+          ready. This requires the caller to grant contents: write. Leave empty to disable.
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  release-ready:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_trigger_tests: ${{ steps.release-ready.outputs.should_trigger_tests }}
+      release_name: ${{ steps.release-metadata.outputs.release_name }}
+      product: ${{ steps.release-ready.outputs.product }}
+    steps:
+      - name: Verify ready-for-review event
+        id: ready-event
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$EVENT_ACTION" = "ready_for_review" ] && [ -n "$PR_NUMBER" ]; then
+            echo "is_ready_event=true" >> "$GITHUB_OUTPUT"
+            echo "Ready-for-review pull request event found."
+          else
+            echo "is_ready_event=false" >> "$GITHUB_OUTPUT"
+            echo "No ready-for-review pull request event found; skipping."
+          fi
+
+      - name: Verify same-repository release-please PR
+        id: release-pr
+        if: ${{ steps.ready-event.outputs.is_ready_event == 'true' }}
+        env:
+          LABEL_NAMES: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          python3 <<'PYTHON'
+          import json
+          import os
+
+          labels = json.loads(os.environ["LABEL_NAMES"] or "[]")
+          has_autorelease_label = any(label.startswith("autorelease:") for label in labels)
+          is_base_repo_branch = os.environ["HEAD_REPOSITORY"] == os.environ["REPOSITORY"]
+          is_release_pr = is_base_repo_branch and has_autorelease_label
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"is_release_pr={str(is_release_pr).lower()}", file=output)
+
+          if is_release_pr:
+              print("Same-repository release-please PR found.")
+          else:
+              print(
+                  f"PR #{os.environ['PR_NUMBER']} is not a base-repo release-please PR "
+                  f"(base-repo-branch={str(is_base_repo_branch).lower()}, "
+                  f"autorelease-label={str(has_autorelease_label).lower()}); skipping."
+              )
+          PYTHON
+
+      - name: Verify release title
+        id: release-metadata
+        if: ${{ steps.release-pr.outputs.is_release_pr == 'true' }}
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python3 <<'PYTHON'
+          import os
+          import re
+
+          match = re.match(r"^(?:chore(?:\([^)]*\))?:\s*)?release(?:\s+(.+))?$", os.environ["PR_TITLE"], re.I)
+          release_name = match.group(1).strip() if match and match.group(1) else ""
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"is_release_title={str(bool(match)).lower()}", file=output)
+              print(f"release_name={release_name}", file=output)
+
+          if match:
+              print("Release-please title shape found.")
+          else:
+              print(f"PR #{os.environ['PR_NUMBER']} title does not match the release-please title shape; skipping.")
+          PYTHON
+
+      - name: Mint GitHub App token
+        id: app-token
+        if: ${{ steps.release-metadata.outputs.is_release_title == 'true' }}
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
+      - name: Label release PR and prepare Slack notification
+        id: release-ready
+        if: ${{ steps.release-metadata.outputs.is_release_title == 'true' }}
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          PRODUCT_NAME: ${{ inputs.product-name }}
+          RELEASE_NAME: ${{ steps.release-metadata.outputs.release_name }}
+          SLACK_CHANNEL: ${{ inputs.slack-channel }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const readyLabel = 'release: ready';
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const repoFullName = `${owner}/${repo}`;
+            const labelNames = pr.labels.map(label => label.name);
+
+            try {
+              await github.rest.issues.getLabel({ owner, repo, name: readyLabel });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: readyLabel,
+                  color: '0E8A16',
+                  description: 'Release PR was marked ready for review',
+                });
+              } else {
+                throw e;
+              }
+            }
+            if (!labelNames.includes(readyLabel)) {
+              await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: [readyLabel] });
+            }
+
+            const releaseName = process.env.RELEASE_NAME;
+            const releaseSuffix = releaseName ? ` ${releaseName}` : '';
+            const serverUrl = process.env.GITHUB_SERVER_URL;
+            const prUrl = `${serverUrl}/${repoFullName}/pull/${pr.number}`;
+            const repoUrl = `${serverUrl}/${repoFullName}`;
+            const actorUrl = `${serverUrl}/${context.actor}`;
+            const productName = process.env.PRODUCT_NAME;
+            const slackChannel = process.env.SLACK_CHANNEL;
+            const text = [
+              `🚀 *${productName}${releaseSuffix} release is ready for review*`,
+              '',
+              `Release PR: <${prUrl}|${pr.title}>`,
+              `Started by: <${actorUrl}|@${context.actor}>`,
+              `Repo: <${repoUrl}|${repoFullName}>`,
+            ].join('\n');
+
+            core.setOutput('should_notify', 'true');
+            core.setOutput('should_trigger_tests', 'true');
+            core.setOutput('payload', JSON.stringify({ channel: slackChannel, text }));
+            core.setOutput('product', productName);
+      - name: Check Slack token availability
+        id: slack-token
+        if: ${{ steps.release-ready.outputs.should_notify == 'true' }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+        run: |
+          if [ -n "$SLACK_BOT_TOKEN" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify Slack
+        if: ${{ steps.slack-token.outputs.available == 'true' }}
+        uses: slackapi/slack-github-action@45a88b9581bfab2566dc881e2cd66d334e621e2c # v3.0.3
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload: ${{ steps.release-ready.outputs.payload }}
+
+  release-test-dispatch-event:
+    name: Trigger release test dispatch event
+    needs: release-ready
+    if: ${{ needs.release-ready.outputs.should_trigger_tests == 'true' && inputs.release-test-event-type != '' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          RELEASE_TEST_EVENT_TYPE: ${{ inputs.release-test-event-type }}
+          RELEASE_NAME: ${{ needs.release-ready.outputs.release_name }}
+          PRODUCT_NAME: ${{ needs.release-ready.outputs.product }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const pr = context.payload.pull_request;
+            await github.rest.repos.createDispatchEvent({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              event_type: process.env.RELEASE_TEST_EVENT_TYPE,
+              client_payload: {
+                pull_request: pr.number,
+                head_ref: pr.head.ref,
+                head_sha: pr.head.sha,
+                base_ref: pr.base.ref,
+                release_name: process.env.RELEASE_NAME,
+                product: process.env.PRODUCT_NAME,
+              },
+            });
+
+  release-test-workflows:
+    name: Trigger release test workflows
+    needs: release-ready
+    if: ${{ needs.release-ready.outputs.should_trigger_tests == 'true' && inputs.release-test-workflows != '' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          RELEASE_TEST_WORKFLOWS: ${{ inputs.release-test-workflows }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const pr = context.payload.pull_request;
+            const workflows = process.env.RELEASE_TEST_WORKFLOWS
+              .split(/\r?\n/)
+              .map(workflow => workflow.trim())
+              .filter(Boolean);
+
+            for (const workflow_id of workflows) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id,
+                ref: pr.head.ref,
+              });
+              core.info(`Dispatched ${workflow_id} for ${pr.head.ref}.`);
+            }
