@@ -52,55 +52,102 @@ jobs:
       contents: read
     outputs:
       should_trigger_tests: ${{ steps.release-ready.outputs.should_trigger_tests }}
-      release_name: ${{ steps.release-ready.outputs.release_name }}
+      release_name: ${{ steps.release-metadata.outputs.release_name }}
       product: ${{ steps.release-ready.outputs.product }}
     steps:
+      - name: Verify ready-for-review event
+        id: ready-event
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$EVENT_ACTION" = "ready_for_review" ] && [ -n "$PR_NUMBER" ]; then
+            echo "is_ready_event=true" >> "$GITHUB_OUTPUT"
+            echo "Ready-for-review pull request event found."
+          else
+            echo "is_ready_event=false" >> "$GITHUB_OUTPUT"
+            echo "No ready-for-review pull request event found; skipping."
+          fi
+
+      - name: Verify same-repository release-please PR
+        id: release-pr
+        if: ${{ steps.ready-event.outputs.is_ready_event == 'true' }}
+        env:
+          LABEL_NAMES: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          python3 <<'PYTHON'
+          import json
+          import os
+
+          labels = json.loads(os.environ["LABEL_NAMES"] or "[]")
+          has_autorelease_label = any(label.startswith("autorelease:") for label in labels)
+          is_base_repo_branch = os.environ["HEAD_REPOSITORY"] == os.environ["REPOSITORY"]
+          is_release_pr = is_base_repo_branch and has_autorelease_label
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"is_release_pr={str(is_release_pr).lower()}", file=output)
+
+          if is_release_pr:
+              print("Same-repository release-please PR found.")
+          else:
+              print(
+                  f"PR #{os.environ['PR_NUMBER']} is not a base-repo release-please PR "
+                  f"(base-repo-branch={str(is_base_repo_branch).lower()}, "
+                  f"autorelease-label={str(has_autorelease_label).lower()}); skipping."
+              )
+          PYTHON
+
+      - name: Verify release title
+        id: release-metadata
+        if: ${{ steps.release-pr.outputs.is_release_pr == 'true' }}
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python3 <<'PYTHON'
+          import os
+          import re
+
+          match = re.match(r"^(?:chore(?:\([^)]*\))?:\s*)?release(?:\s+(.+))?$", os.environ["PR_TITLE"], re.I)
+          release_name = match.group(1).strip() if match and match.group(1) else ""
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"is_release_title={str(bool(match)).lower()}", file=output)
+              print(f"release_name={release_name}", file=output)
+
+          if match:
+              print("Release-please title shape found.")
+          else:
+              print(f"PR #{os.environ['PR_NUMBER']} title does not match the release-please title shape; skipping.")
+          PYTHON
+
       - name: Mint GitHub App token
         id: app-token
+        if: ${{ steps.release-metadata.outputs.is_release_title == 'true' }}
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
-      - name: Prepare release-ready notification
+      - name: Label release PR and prepare Slack notification
         id: release-ready
+        if: ${{ steps.release-metadata.outputs.is_release_title == 'true' }}
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           PRODUCT_NAME: ${{ inputs.product-name }}
+          RELEASE_NAME: ${{ steps.release-metadata.outputs.release_name }}
           SLACK_CHANNEL: ${{ inputs.slack-channel }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const readyLabel = 'release: ready';
             const pr = context.payload.pull_request;
-            if (!pr || context.payload.action !== 'ready_for_review') {
-              core.info('No ready-for-review pull request event found; skipping.');
-              core.setOutput('should_notify', 'false');
-              core.setOutput('should_trigger_tests', 'false');
-              return;
-            }
-
             const { owner, repo } = context.repo;
             const repoFullName = `${owner}/${repo}`;
             const labelNames = pr.labels.map(label => label.name);
-            const hasAutoreleaseLabel = labelNames.some(label => label.startsWith('autorelease:'));
-            const isBaseRepoBranch = pr.head.repo?.full_name === repoFullName;
-
-            if (!isBaseRepoBranch || !hasAutoreleaseLabel) {
-              core.info(`PR #${pr.number} is not a base-repo release-please PR (base-repo-branch=${isBaseRepoBranch}, autorelease-label=${hasAutoreleaseLabel}); skipping.`);
-              core.setOutput('should_notify', 'false');
-              core.setOutput('should_trigger_tests', 'false');
-              return;
-            }
-
-            const releaseTitleMatch = pr.title.match(/^(?:chore(?:\([^)]*\))?:\s*)?release(?:\s+(.+))?$/i);
-            if (!releaseTitleMatch) {
-              core.info(`PR #${pr.number} title does not match the release-please title shape; skipping.`);
-              core.setOutput('should_notify', 'false');
-              core.setOutput('should_trigger_tests', 'false');
-              return;
-            }
-            const releaseName = releaseTitleMatch[1]?.trim() || '';
 
             try {
               await github.rest.issues.getLabel({ owner, repo, name: readyLabel });
@@ -121,6 +168,7 @@ jobs:
               await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: [readyLabel] });
             }
 
+            const releaseName = process.env.RELEASE_NAME;
             const releaseSuffix = releaseName ? ` ${releaseName}` : '';
             const serverUrl = process.env.GITHUB_SERVER_URL;
             const prUrl = `${serverUrl}/${repoFullName}/pull/${pr.number}`;
@@ -139,9 +187,7 @@ jobs:
             core.setOutput('should_notify', 'true');
             core.setOutput('should_trigger_tests', 'true');
             core.setOutput('payload', JSON.stringify({ channel: slackChannel, text }));
-            core.setOutput('release_name', releaseName);
             core.setOutput('product', productName);
-
       - name: Check Slack token availability
         id: slack-token
         if: ${{ steps.release-ready.outputs.should_notify == 'true' }}
