@@ -41,6 +41,13 @@ on:
         required: false
         type: string
         default: ""
+      ready-labels:
+        description: >-
+          Newline- or comma-separated labels to add (in addition to
+          `release: ready`) when a release PR is marked ready for review.
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -140,32 +147,42 @@ jobs:
           PRODUCT_NAME: ${{ inputs.product-name }}
           RELEASE_NAME: ${{ steps.release-metadata.outputs.release_name }}
           SLACK_CHANNEL: ${{ inputs.slack-channel }}
+          READY_LABELS: ${{ inputs.ready-labels }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const readyLabel = 'release: ready';
             const pr = context.payload.pull_request;
             const { owner, repo } = context.repo;
             const repoFullName = `${owner}/${repo}`;
             const labelNames = pr.labels.map(label => label.name);
 
-            try {
-              await github.rest.issues.getLabel({ owner, repo, name: readyLabel });
-            } catch (e) {
-              if (e.status === 404) {
-                await github.rest.issues.createLabel({
-                  owner,
-                  repo,
-                  name: readyLabel,
-                  color: '0E8A16',
-                  description: 'Release PR was marked ready for review',
-                });
-              } else {
-                throw e;
+            // `release: ready` plus any caller `ready-labels` (newline-/comma-
+            // separated); known labels keep their styling, extras default to grey.
+            const KNOWN_LABELS = {
+              'release: ready': { color: '0E8A16', description: 'Release PR was marked ready for review' },
+            };
+            const extra = (process.env.READY_LABELS || '')
+              .split(/[\r\n,]+/)
+              .map(name => name.trim())
+              .filter(Boolean);
+            const desired = [...new Set(['release: ready', ...extra])];
+
+            for (const name of desired) {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+              } catch (e) {
+                if (e.status === 404) {
+                  const style = KNOWN_LABELS[name] || { color: 'EDEDED' };
+                  await github.rest.issues.createLabel({ owner, repo, name, ...style });
+                } else {
+                  throw e;
+                }
               }
             }
-            if (!labelNames.includes(readyLabel)) {
-              await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: [readyLabel] });
+
+            const missing = desired.filter(name => !labelNames.includes(name));
+            if (missing.length) {
+              await github.rest.issues.addLabels({ owner, repo, issue_number: pr.number, labels: missing });
             }
 
             const releaseName = process.env.RELEASE_NAME;
