@@ -1,0 +1,32 @@
+name: test
+
+# Runs the release-please script unit tests on PRs that touch them.
+#
+# Plain `pull_request` (NOT pull_request_target): these tests EXECUTE repo code,
+# so they must run with the PR's read-only token, never the base repo's secrets.
+# The job needs no write permissions and no App credentials.
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/test.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      # No `npm install`: the module under test has no imports, and the tests use
+      # Node's built-in runner plus a fake GitHub client. `npm test` runs
+      # `node --test`, which exits non-zero on any failure and fails the job.
+      - name: Unit tests
+        working-directory: scripts/release-please
+        run: npm test

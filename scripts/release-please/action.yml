@@ -1,0 +1,66 @@
+name: release-please (GitHub-scoped notes)
+description: >-
+  Library-mode release-please with a custom GitHub-style, path-scoped
+  ChangelogNotes. A drop-in for googleapis/release-please-action whose release PR
+  body AND published Release get identical GitHub-style notes, scoped per package
+  path — the format that action's "github" changelog type can't scope in a
+  monorepo.
+
+inputs:
+  token:
+    description: >-
+      GitHub App token. Events must originate from an App so downstream
+      workflows (required CI on the release PR, tag-triggered publishers) fire.
+    required: true
+  target-branch:
+    description: Branch to release from (usually the branch that triggered the caller).
+    required: true
+  config-file:
+    description: release-please config file path, read from the consumer repo via the API.
+    required: true
+  manifest-file:
+    description: release-please manifest file path, read from the consumer repo via the API.
+    required: true
+
+outputs:
+  release_created:
+    description: '"true" if a release was created this run.'
+    value: ${{ steps.run.outputs.release_created }}
+  tag_name:
+    description: Tag of the created release (e.g. openhands-v0.7.69).
+    value: ${{ steps.run.outputs.tag_name }}
+  version:
+    description: Version of the created release (e.g. 0.7.69).
+    value: ${{ steps.run.outputs.version }}
+  sha:
+    description: Commit SHA the release was tagged at.
+    value: ${{ steps.run.outputs.sha }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: '20'
+
+    # Install release-please into THIS action's directory (its package.json pins
+    # the version), so `import 'release-please'` resolves regardless of the
+    # consumer repo's own toolchain. A lockfile + `npm ci` should replace this
+    # for production reproducibility.
+    - name: Install release-please
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: npm install --no-audit --no-fund
+
+    - name: Run release-please (custom notes)
+      id: run
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        TARGET_BRANCH: ${{ inputs.target-branch }}
+        CONFIG_FILE: ${{ inputs.config-file }}
+        MANIFEST_FILE: ${{ inputs.manifest-file }}
+      run: node run.mjs

@@ -33,6 +33,18 @@ on:
         required: false
         type: string
         default: .release-please-manifest.json
+      github-scoped-notes:
+        description: >-
+          Opt-in (default false). When false, releases run through the stock
+          googleapis/release-please-action — unchanged behavior. When true, they
+          run through the library-mode engine that emits GitHub-style release
+          notes scoped per package path (so the release PR body and the published
+          Release carry the same `## What's Changed` notes). Packages also opt in
+          per line with `"changelog-type": "github-scoped"` in their config; any
+          line left on another changelog-type keeps release-please's stock notes.
+        required: false
+        type: boolean
+        default: false
 
 # Declared here as the cap; the caller job must also grant these or the token
 # can't be elevated to them (effective perms are the intersection of the two).
@@ -67,8 +79,18 @@ jobs:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
-      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
-        id: release
+      # Two mutually-exclusive engines, selected by the `github-scoped-notes`
+      # flag; exactly one runs. Both expose the same release_created / tag_name /
+      # version / sha outputs, which the normalize step below funnels into a
+      # single `release` id so the back-labeling step is identical either way.
+
+      # DEFAULT engine: stock googleapis/release-please-action. Unchanged from
+      # before the GitHub-scoped-notes work — this is what runs unless a caller
+      # opts in.
+      - name: release-please (stock action)
+        if: ${{ !inputs.github-scoped-notes }}
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+        id: release_stock
         with:
           token: ${{ steps.app-token.outputs.token }}
           # Manifest mode. Defaults to release-please-config.json /
@@ -80,6 +102,48 @@ jobs:
           # just "main" (the default); on a release/** branch it scopes the
           # release to that maintenance line so a hotfix ships only its fix.
           target-branch: ${{ github.ref_name }}
+
+      # OPT-IN engine: library-mode release-please (a local composite action) so
+      # it can register a custom ChangelogNotes that emits GitHub-style notes
+      # scoped per package path. The action exposes no hook for custom notes; the
+      # library does (registerChangelogNotes). Versioning / release PR / tag /
+      # Release are otherwise stock release-please.
+      #
+      # The release PR body and the published Release get the SAME GitHub-style
+      # notes: release-please builds the PR body from our notes, and at release
+      # time copies the Release body verbatim out of the merged PR body.
+      #
+      # Pinned at @main (action `uses:` refs must be literal). Consumers that pin
+      # this reusable workflow at @main get matching scripts; a tagged pin can
+      # skew from main until this is cut into the same tag.
+      - name: release-please (GitHub-scoped notes)
+        if: ${{ inputs.github-scoped-notes }}
+        uses: OpenHands/release-actions/scripts/release-please@main
+        id: release_custom
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: ${{ inputs.config-file }}
+          manifest-file: ${{ inputs.manifest-file }}
+          target-branch: ${{ github.ref_name }}
+
+      # Funnel whichever engine ran into one `release` id. The skipped step's
+      # outputs are empty, so `||` selects the engine that actually ran. The
+      # back-labeling step below reads only `steps.release.outputs.*` and is
+      # unaffected by the flag.
+      - name: Normalize release outputs
+        id: release
+        env:
+          RELEASE_CREATED: ${{ steps.release_stock.outputs.release_created || steps.release_custom.outputs.release_created }}
+          TAG_NAME: ${{ steps.release_stock.outputs.tag_name || steps.release_custom.outputs.tag_name }}
+          VERSION: ${{ steps.release_stock.outputs.version || steps.release_custom.outputs.version }}
+          SHA: ${{ steps.release_stock.outputs.sha || steps.release_custom.outputs.sha }}
+        run: |
+          {
+            echo "release_created=${RELEASE_CREATED}"
+            echo "tag_name=${TAG_NAME}"
+            echo "version=${VERSION}"
+            echo "sha=${SHA}"
+          } >> "$GITHUB_OUTPUT"
 
       # When a release is cut, go back and tag every PR that shipped in it with a
       # `released: <tag>` label (and a short comment). Not a release-please

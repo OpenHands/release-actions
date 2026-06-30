@@ -1,0 +1,13 @@
+{
+  "name": "release-please-github-scoped-notes",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Library-mode release-please driver with a custom GitHub-style, path-scoped ChangelogNotes (prototype).",
+  "scripts": {
+    "test": "node --test *.test.mjs"
+  },
+  "dependencies": {
+    "release-please": "17.3.0"
+  }
+}
