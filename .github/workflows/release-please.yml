@@ -67,13 +67,26 @@ jobs:
           app-id: ${{ secrets.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
 
-      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
+      # Library-mode release-please (a local composite action) INSTEAD of
+      # googleapis/release-please-action, so it can register a custom
+      # ChangelogNotes that emits GitHub-style notes scoped per package path. The
+      # action exposes no hook for custom notes; the library does
+      # (registerChangelogNotes). Versioning / release PR / tag / Release are
+      # otherwise stock release-please, so the outputs below match the action's.
+      #
+      # The release PR body and the published Release get the SAME GitHub-style
+      # notes: release-please builds the PR body from our notes, and at release
+      # time copies the Release body verbatim out of the merged PR body.
+      #
+      # Pinned at @main (action `uses:` refs must be literal). Consumers that pin
+      # this reusable workflow at @main get matching scripts; a tagged pin can
+      # skew from main until this is cut into the same tag.
+      - uses: OpenHands/release-actions/scripts/release-please@main
         id: release
         with:
           token: ${{ steps.app-token.outputs.token }}
-          # Manifest mode. Defaults to release-please-config.json /
-          # .release-please-manifest.json at the repo root; a caller can point at
-          # other files to run a second, independent release line from one repo.
+          # Manifest mode. A caller points at per-artifact files to run an
+          # independent release line per package from one repo.
           config-file: ${{ inputs.config-file }}
           manifest-file: ${{ inputs.manifest-file }}
           # Release against whichever branch triggered the caller. On main this is
