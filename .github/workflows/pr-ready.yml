@@ -1,19 +1,10 @@
 name: release ready
 
-# Caller: dogfoods this repo's own reusable release-ready workflow. When a PR is
-# marked ready for review, hand off to release-ready.yml, which labels the
-# release PR (release: ready), notifies Slack, and can trigger release tests.
-# A consumer repo has an identical file, but with `uses:` pointing at this repo
-# by tag instead of the local `./` path.
-#
-# The trigger lives here (not in the reusable workflow) because the
-# ready_for_review event is emitted by the repo that owns the release PR.
-#
-# pull_request_target (NOT pull_request) so the label step runs with a writable
-# token in the base-repo context. SAFE because release-ready.yml never checks
-# out or runs PR code — it only reads PR metadata from the event payload,
-# refuses fork PRs, and requires an existing autorelease:* label before acting.
-# Do NOT add a checkout step.
+# Caller: on ready-for-review, delegate to the reusable release-ready workflow
+# (labels the release PR + notifies Slack). The trigger lives here because
+# ready_for_review fires in the repo that owns the release PR. Safe under
+# pull_request_target — release-ready.yml never checks out or runs PR code, so
+# do NOT add a checkout step.
 on:
   pull_request_target:
     types: [ready_for_review]
@@ -21,11 +12,11 @@ on:
 jobs:
   release-ready:
     permissions:
-      actions: read # change to write only when `release-test-workflows` is set
-      contents: read # change to write only when `release-test-event-type` is set
+      actions: read # write only if `release-test-workflows` is set
+      contents: read # write only if `release-test-event-type` is set
       issues: write
       pull-requests: write
-    secrets: inherit # passes RELEASE_APP_* and SLACK_BOT_TOKEN through
+    secrets: inherit # RELEASE_APP_* + SLACK_BOT_TOKEN
     uses: ./.github/workflows/release-ready.yml
     with:
       product-name: Release Actions

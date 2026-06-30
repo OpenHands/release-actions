@@ -156,9 +156,8 @@ jobs:
             const repoFullName = `${owner}/${repo}`;
             const labelNames = pr.labels.map(label => label.name);
 
-            // `release: ready` is always applied; callers add more via the
-            // `ready-labels` input (newline- or comma-separated). Known labels
-            // keep their styling; caller-supplied extras default to grey.
+            // `release: ready` plus any caller `ready-labels` (newline-/comma-
+            // separated); known labels keep their styling, extras default to grey.
             const KNOWN_LABELS = {
               'release: ready': { color: '0E8A16', description: 'Release PR was marked ready for review' },
             };
