@@ -30,3 +30,4 @@ jobs:
     with:
       product-name: Release Actions
       slack-channel: "#proj-agent-canvas"
+      ready-labels: integration-tests
