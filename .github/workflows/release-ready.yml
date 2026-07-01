@@ -78,6 +78,7 @@ jobs:
       contents: read
     outputs:
       should_trigger_tests: ${{ steps.release-ready.outputs.should_trigger_tests }}
+      should_freeze: ${{ steps.release-ready.outputs.should_freeze }}
       release_name: ${{ steps.release-metadata.outputs.release_name }}
       product: ${{ steps.release-ready.outputs.product }}
     steps:
@@ -167,6 +168,8 @@ jobs:
           RELEASE_NAME: ${{ steps.release-metadata.outputs.release_name }}
           SLACK_CHANNEL: ${{ inputs.slack-channel }}
           READY_LABELS: ${{ inputs.ready-labels }}
+          FREEZE_ON_READY: ${{ inputs.freeze-on-ready }}
+          FREEZE_BRANCH_PREFIX: ${{ inputs.freeze-branch-prefix }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
@@ -174,6 +177,20 @@ jobs:
             const { owner, repo } = context.repo;
             const repoFullName = `${owner}/${repo}`;
             const labelNames = pr.labels.map(label => label.name);
+
+            // When freeze-on-ready is on and this is a PR on the primary branch
+            // (not already a freeze branch), the real release cut moves to the
+            // frozen branch's PR. Defer labeling / Slack / tests to that PR and
+            // let the `freeze` job run instead.
+            const isFreeze =
+              process.env.FREEZE_ON_READY === 'true' &&
+              !pr.base.ref.startsWith(process.env.FREEZE_BRANCH_PREFIX);
+            if (isFreeze) {
+              core.setOutput('should_freeze', 'true');
+              core.info('freeze-on-ready: deferring labels/Slack/tests to the frozen release PR.');
+              return;
+            }
+            core.setOutput('should_freeze', 'false');
 
             // `release: ready` plus any caller `ready-labels` (newline-/comma-
             // separated); known labels keep their styling, extras default to grey.
@@ -318,7 +335,10 @@ jobs:
   freeze:
     name: Freeze release to a release/** branch
     needs: release-ready
-    if: ${{ needs.release-ready.outputs.should_trigger_tests == 'true' && inputs.freeze-on-ready && github.event.pull_request.head.repo.full_name == github.repository && !startsWith(github.event.pull_request.base.ref, inputs.freeze-branch-prefix) }}
+    # should_freeze is set only for a valid release PR on the primary branch when
+    # freeze-on-ready is on (see the release-ready job). The frozen branch's PR
+    # takes the normal label/Slack/test path instead.
+    if: ${{ needs.release-ready.outputs.should_freeze == 'true' && github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
