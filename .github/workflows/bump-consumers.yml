@@ -1,0 +1,157 @@
+name: Bump release-actions in consumers
+
+# Goes in OpenHands/release-actions at .github/workflows/bump-consumers.yml
+#
+# When a release-actions release is published, open a PR in each consumer repo
+# pinning the `uses: OpenHands/release-actions/.github/workflows/*.yml@<ref>`
+# references to the just-released tag. Modeled on software-agent-sdk's
+# version-bump-prs.yml, but it edits reusable-workflow refs instead of package
+# pins, and it uses the shared release App (house style) rather than a PAT.
+#
+# PERMISSION GOTCHA (read before deploying): the refs we rewrite live under
+# .github/workflows/ in the consumer repo. A GitHub App installation token can
+# only push workflow-file changes if the App has the "Workflows: write"
+# permission. The shared release App (RELEASE_APP_ID / RELEASE_APP_PRIVATE_KEY)
+# must be granted that permission on OpenHands/typescript-client (org-wide is
+# fine). If you'd rather not widen the App, swap steps.app-token for a PAT that
+# carries the `workflow` scope — this is exactly what version-bump-prs.yml does
+# to edit typescript-client's integration-tests.yml today.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Tag to pin consumers to (e.g. v0.3.0 or 0.3.0)
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: bump-consumers-${{ github.event.release.tag_name || github.event.inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  bump-typescript-client:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # We act on the consumer repo exclusively via the App token minted below,
+    # never via this workflow's GITHUB_TOKEN, so the job needs no permissions.
+    permissions: {}
+    env:
+      TARGET_REPO: OpenHands/typescript-client
+    steps:
+      - name: Resolve version tag
+        id: v
+        env:
+          RAW: ${{ github.event.release.tag_name || github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          TAG="$RAW"
+          # Accept both 0.3.0 and v0.3.0; normalize to a leading-v tag.
+          [[ "$TAG" =~ ^v ]] || TAG="v$TAG"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version '$RAW' (expected vX.Y.Z or X.Y.Z)"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Pinning consumers to $TAG"
+
+      # Same shared release App the rest of release-actions uses. Scoped to the
+      # single consumer repo via owner/repositories. Inherits every permission
+      # the App has (see the Workflows: write note in the header).
+      - name: Mint App token (scoped to the consumer repo)
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: OpenHands
+          repositories: typescript-client
+
+      - name: Checkout consumer repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: true
+
+      - name: Pin release-actions refs to the release tag
+        id: edit
+        env:
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for f in .github/workflows/*.yml .github/workflows/*.yaml; do
+            grep -q 'OpenHands/release-actions/\.github/workflows/' "$f" || continue
+            # Rewrite the @<ref> on any release-actions reusable-workflow `uses:`.
+            # Matches @main and any prior @vX.Y.Z; the ref is the last token on
+            # the line, so [^[:space:]]+ captures it and stops at EOL/comment.
+            sed -i -E \
+              "s#(OpenHands/release-actions/\.github/workflows/[A-Za-z0-9._-]+\.ya?ml)@[^[:space:]]+#\1@${TAG}#g" \
+              "$f"
+          done
+          if git diff --quiet; then
+            echo "Consumer already pinned to ${TAG} — nothing to do."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git --no-pager diff
+          fi
+
+      - name: Open bump PR
+        if: steps.edit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          set -euo pipefail
+          BRANCH="bump-release-actions-${TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git switch -c "$BRANCH"
+          git add .github/workflows
+          git commit -m "chore: bump release-actions to ${TAG}"
+          # Force-push so reruns for the same tag refresh an existing bot branch.
+          git push --force -u origin "$BRANCH"
+
+          if [ -n "$(gh pr list --repo "$TARGET_REPO" --head "$BRANCH" --json number --jq '.[0].number')" ]; then
+            echo "PR already open for $BRANCH."
+            exit 0
+          fi
+
+          cat > /tmp/pr_body.md <<EOF
+          ## Pin release-actions to ${TAG}
+
+          Updates the \`OpenHands/release-actions\` reusable-workflow refs
+          (\`uses: ...@<ref>\`) in this repo's workflows to \`${TAG}\`.
+
+          Triggered by release-actions **${TAG}**:
+          https://github.com/OpenHands/release-actions/releases/tag/${TAG}
+
+          ---
+          _Automatically opened by the \`bump-consumers\` workflow in release-actions._
+          EOF
+
+          gh pr create --repo "$TARGET_REPO" --base main --head "$BRANCH" \
+            --title "chore: bump release-actions to ${TAG}" \
+            --body-file /tmp/pr_body.md
+
+      - name: Summary
+        if: always()
+        env:
+          TAG: ${{ steps.v.outputs.tag }}
+          CHANGED: ${{ steps.edit.outputs.changed }}
+        run: |
+          {
+            echo "## release-actions consumer bump"
+            echo ""
+            if [ "${CHANGED:-false}" = "true" ]; then
+              echo "Opened/updated a PR pinning **${TARGET_REPO}** to **${TAG}**."
+            else
+              echo "**${TARGET_REPO}** was already pinned to **${TAG}** — no PR needed."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
