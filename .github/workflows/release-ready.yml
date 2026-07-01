@@ -48,6 +48,25 @@ on:
         required: false
         type: string
         default: ""
+      freeze-on-ready:
+        description: >-
+          When true, marking a release PR ready-for-review cuts a
+          `<freeze-branch-prefix><major.minor>` branch at the PR's base SHA and
+          returns the PR to draft. release-please then cuts the release from that
+          frozen branch (release.yml already runs on `release/**`), so commits
+          pushed to the base branch afterwards cannot enter this release. Requires
+          the caller to grant `contents: write`, `pull-requests: write`, and
+          `issues: write`.
+        required: false
+        type: boolean
+        default: false
+      freeze-branch-prefix:
+        description: >-
+          Branch prefix for freeze branches (default `release/`). A release for
+          version X.Y.Z is frozen to `<prefix>X.Y`.
+        required: false
+        type: string
+        default: release/
 
 permissions:
   contents: read
@@ -59,6 +78,7 @@ jobs:
       contents: read
     outputs:
       should_trigger_tests: ${{ steps.release-ready.outputs.should_trigger_tests }}
+      should_freeze: ${{ steps.release-ready.outputs.should_freeze }}
       release_name: ${{ steps.release-metadata.outputs.release_name }}
       product: ${{ steps.release-ready.outputs.product }}
     steps:
@@ -148,6 +168,8 @@ jobs:
           RELEASE_NAME: ${{ steps.release-metadata.outputs.release_name }}
           SLACK_CHANNEL: ${{ inputs.slack-channel }}
           READY_LABELS: ${{ inputs.ready-labels }}
+          FREEZE_ON_READY: ${{ inputs.freeze-on-ready }}
+          FREEZE_BRANCH_PREFIX: ${{ inputs.freeze-branch-prefix }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
@@ -155,6 +177,20 @@ jobs:
             const { owner, repo } = context.repo;
             const repoFullName = `${owner}/${repo}`;
             const labelNames = pr.labels.map(label => label.name);
+
+            // When freeze-on-ready is on and this is a PR on the primary branch
+            // (not already a freeze branch), the real release cut moves to the
+            // frozen branch's PR. Defer labeling / Slack / tests to that PR and
+            // let the `freeze` job run instead.
+            const isFreeze =
+              process.env.FREEZE_ON_READY === 'true' &&
+              !pr.base.ref.startsWith(process.env.FREEZE_BRANCH_PREFIX);
+            if (isFreeze) {
+              core.setOutput('should_freeze', 'true');
+              core.info('freeze-on-ready: deferring labels/Slack/tests to the frozen release PR.');
+              return;
+            }
+            core.setOutput('should_freeze', 'false');
 
             // `release: ready` plus any caller `ready-labels` (newline-/comma-
             // separated); known labels keep their styling, extras default to grey.
@@ -285,4 +321,92 @@ jobs:
                 ref: pr.head.ref,
               });
               core.info(`Dispatched ${workflow_id} for ${pr.head.ref}.`);
+            }
+
+  # Opt-in (freeze-on-ready). When a release PR on the primary branch is marked
+  # ready, snapshot it onto a release/<major.minor> branch and return the PR to
+  # draft. release.yml runs on release/**, so release-please then cuts the
+  # release from the frozen branch — commits pushed to the base branch afterwards
+  # can no longer enter this release. Skips PRs already based on a freeze branch
+  # (so marking the frozen PR ready runs the normal label/Slack/test path above).
+  #
+  # The branch MUST be created with the App token: a ref created by GITHUB_TOKEN
+  # would not emit a push event, so release-please would never run on it.
+  freeze:
+    name: Freeze release to a release/** branch
+    needs: release-ready
+    # should_freeze is set only for a valid release PR on the primary branch when
+    # freeze-on-ready is on (see the release-ready job). The frozen branch's PR
+    # takes the normal label/Slack/test path instead.
+    if: ${{ needs.release-ready.outputs.should_freeze == 'true' && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Mint GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - name: Cut freeze branch and return the release PR to draft
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        env:
+          RELEASE_NAME: ${{ needs.release-ready.outputs.release_name }}
+          FREEZE_BRANCH_PREFIX: ${{ inputs.freeze-branch-prefix }}
+        with:
+          # App token so the createRef push fires release.yml on release/**.
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+
+            // Derive release/<major.minor> from the version (e.g. 1.31.0 -> release/1.31).
+            const releaseName = (process.env.RELEASE_NAME || '').trim();
+            const match = releaseName.match(/^(\d+)\.(\d+)\.\d+/);
+            if (!match) {
+              core.warning(`Cannot derive a freeze branch from release name "${releaseName}"; skipping freeze.`);
+              return;
+            }
+            const branch = `${process.env.FREEZE_BRANCH_PREFIX}${match[1]}.${match[2]}`;
+            const freezeSha = pr.base.sha; // tip of the base branch this release PR is built on
+
+            // 1. Cut the freeze branch at the frozen SHA (idempotent).
+            let created = false;
+            try {
+              await github.rest.git.getRef({ owner, repo, ref: `heads/${branch}` });
+              core.info(`Freeze branch ${branch} already exists; leaving it as-is.`);
+            } catch (e) {
+              if (e.status !== 404) throw e;
+              await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${branch}`, sha: freezeSha });
+              created = true;
+              core.info(`Cut freeze branch ${branch} at ${freezeSha}.`);
+            }
+
+            // 2. Announce on the release PR.
+            const branchUrl = `${context.serverUrl}/${owner}/${repo}/tree/${branch}`;
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number: pr.number,
+              body: [
+                `🧊 **Release frozen to \`${branch}\`** at \`${freezeSha.slice(0, 7)}\`.`,
+                '',
+                `release-please will open the release PR on [\`${branch}\`](${branchUrl}) — review, test, and **merge that one** to publish. Commits pushed to \`${pr.base.ref}\` after this point are not part of this release.`,
+                '',
+                `This PR has been returned to draft so it is not merged from the moving \`${pr.base.ref}\` branch; it stays as the preview of the next release.`,
+              ].join('\n'),
+            });
+
+            // 3. Return the PR to draft (GraphQL; the REST API cannot toggle draft state).
+            try {
+              await github.graphql(
+                `mutation($id: ID!) { convertPullRequestToDraft(input: { pullRequestId: $id }) { pullRequest { number } } }`,
+                { id: pr.node_id },
+              );
+              core.info(`Returned PR #${pr.number} to draft.`);
+            } catch (e) {
+              core.warning(`Could not convert PR #${pr.number} to draft: ${e.message}`);
             }

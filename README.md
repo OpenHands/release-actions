@@ -242,6 +242,43 @@ open for the same version while you soak. Leave it alone — merging it would pu
 from `main` and pull in everything that landed after your cut. You publish from the branch
 instead, then merge back.
 
+### Automating the freeze on ready-for-review
+
+The steps below cut the freeze branch by hand. `release-ready.yml` can do it for
+you: set `freeze-on-ready: true` on the caller and marking the
+`chore(main): release …` PR **ready for review** becomes the freeze signal.
+
+```yaml
+# .github/workflows/release-ready.yml
+jobs:
+  release-ready:
+    permissions:
+      actions: read
+      contents: write # required by freeze-on-ready to cut the branch
+      issues: write
+      pull-requests: write
+    secrets: inherit
+    uses: OpenHands/release-actions/.github/workflows/release-ready.yml@main
+    with:
+      product-name: My Product
+      slack-channel: "#my-channel"
+      freeze-on-ready: true
+```
+
+With it on, marking the release PR ready:
+
+1. cuts `release/<major.minor>` at the PR's base SHA — with the **App token**, so
+   the branch's push event fires and release-please picks it up (a
+   `GITHUB_TOKEN` ref would be silently ignored), and
+2. returns the `chore(main)` PR to draft so it can't be merged from the moving
+   base branch; it stays as the next-release preview.
+
+release-please then opens the release PR on the frozen branch. Mark **that** one
+ready to run the normal label/Slack/test path and publish it — because it's based
+on a `release/**` branch, the freeze step skips itself. `freeze-branch-prefix`
+(default `release/`) sets the prefix. Finish with the "merge back into `main`"
+step below.
+
 A typical freeze would look like this:
 
 1. Cut the release branch from `main` when you're ready to freeze.
