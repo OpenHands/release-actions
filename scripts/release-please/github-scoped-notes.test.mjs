@@ -45,16 +45,26 @@ function fakeOctokit({prsByCommit = {}, earliestByAuthor = {}} = {}) {
   };
 }
 
+// buildNotes() leads with the same `## <version> (<date>)` header release-please's
+// stock github changelog type emits — load-bearing for the release-time parse
+// round-trip (see github-scoped-notes.mjs). Fix the clock so the date is
+// deterministic; `new Date(2026, 0, 1)` is LOCAL midnight, so toLocaleDateString
+// yields "2026-01-01" regardless of the runner's time zone.
+const DATE = '2026-01-01';
+const FIXED_CLOCK = () => new Date(2026, 0, 1);
+const header = v => `## ${v} (${DATE})`;
+
 function notes(fixtures) {
   return new GitHubScopedChangelogNotes({
     octokit: fakeOctokit(fixtures),
     owner: 'o',
     repo: 'r',
     logger: {warn() {}, info() {}},
+    now: FIXED_CLOCK,
   });
 }
 
-const OPTS = {previousTag: 'c-v1.0.0', currentTag: 'c-v1.1.0'};
+const OPTS = {version: '1.1.0', previousTag: 'c-v1.0.0', currentTag: 'c-v1.1.0'};
 const FULL = '**Full Changelog**: https://github.com/o/r/compare/c-v1.0.0...c-v1.1.0';
 
 test('namedCategoryFor maps labels to the first matching named category', () => {
@@ -84,6 +94,8 @@ test('flat list (oldest-first) when no PR carries a named-category label', async
   // release-please hands commits newest-first; output must be oldest-first.
   const out = await n.buildNotes([commit('s2'), commit('s1')], OPTS);
   assert.equal(out, [
+    header('1.1.0'),
+    '',
     "## What's Changed",
     `* First by @alice in ${url(101)}`,
     `* Second by @bob in ${url(102)}`,
@@ -104,6 +116,8 @@ test('sections render in category order, contiguous, with the catch-all', async 
   const out = await n.buildNotes(
     [commit('s4'), commit('s3'), commit('s2'), commit('s1')], OPTS);
   assert.equal(out, [
+    header('1.1.0'),
+    '',
     "## What's Changed",
     '### Features',
     `* Add X by @alice in ${url(201)}`,
@@ -138,6 +152,8 @@ test('New Contributors lists only authors whose earliest merged PR is in this re
   });
   const out = await n.buildNotes([commit('s2'), commit('s1')], OPTS);
   assert.equal(out, [
+    header('1.1.0'),
+    '',
     "## What's Changed",
     `* A1 by @newbie in ${url(401)}`,
     `* B1 by @veteran in ${url(402)}`,
@@ -151,8 +167,8 @@ test('New Contributors lists only authors whose earliest merged PR is in this re
 
 test('omits Full Changelog when there is no previous tag (first release of a line)', async () => {
   const n = notes({prsByCommit: {s1: [pr(501, {title: 'Init', login: 'alice'})]}});
-  const out = await n.buildNotes([commit('s1')], {currentTag: 'c-v1.0.0'});
-  assert.equal(out, ["## What's Changed", `* Init by @alice in ${url(501)}`].join('\n'));
+  const out = await n.buildNotes([commit('s1')], {version: '1.0.0', currentTag: 'c-v1.0.0'});
+  assert.equal(out, [header('1.0.0'), '', "## What's Changed", `* Init by @alice in ${url(501)}`].join('\n'));
 });
 
 test('skips PRs that are not merged', async () => {
@@ -174,8 +190,8 @@ test('ignores commits with no associated PR', async () => {
 });
 
 test('placeholder when there are no commits', async () => {
-  const out = await notes().buildNotes([], {currentTag: 'c-v1.0.0'});
-  assert.equal(out, "## What's Changed\n\n_No changes in this release._");
+  const out = await notes().buildNotes([], {version: '1.0.0', currentTag: 'c-v1.0.0'});
+  assert.equal(out, `${header('1.0.0')}\n\n## What's Changed\n\n_No changes in this release._`);
 });
 
 test('does not throw when the PR lookup fails', async () => {
@@ -184,7 +200,7 @@ test('does not throw when the PR lookup fails', async () => {
     search: {issuesAndPullRequests: async () => ({data: {items: []}})},
     paginate: async (fn, params) => fn(params),
   };
-  const n = new GitHubScopedChangelogNotes({octokit, owner: 'o', repo: 'r', logger: {warn() {}}});
-  const out = await n.buildNotes([commit('s1')], {currentTag: 'c-v1.0.0'});
-  assert.equal(out, "## What's Changed\n\n_No changes in this release._");
+  const n = new GitHubScopedChangelogNotes({octokit, owner: 'o', repo: 'r', logger: {warn() {}}, now: FIXED_CLOCK});
+  const out = await n.buildNotes([commit('s1')], {version: '1.0.0', currentTag: 'c-v1.0.0'});
+  assert.equal(out, `${header('1.0.0')}\n\n## What's Changed\n\n_No changes in this release._`);
 });

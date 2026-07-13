@@ -10,8 +10,16 @@
 //
 // The key property we exploit (release-please source, strategies/base.js):
 //   * buildPullRequestBody() wraps THIS function's output as the release PR body.
-//   * at release time, the published Release body is copied VERBATIM out of the
-//     merged PR body (it is never regenerated).
+//   * at release time, the published Release body is NOT regenerated — it is
+//     parsed back out of the merged PR body (PullRequestBody.parse, called from
+//     Strategy.buildRelease). For a single-package release line (one release per
+//     PR, as here) that parser only recognizes a notes block that STARTS with a
+//     `## <version>` header (util/pull-request-body.js -> extractSingleRelease ->
+//     COMPARE_REGEX). Our GitHub-style notes lead with "## What's Changed", so
+//     buildNotes() MUST prepend that version header — exactly as release-please's
+//     stock "github" changelog type does (changelog-notes/github.js). Omit it and
+//     the parse finds zero releases: the Release ships with an EMPTY body even
+//     though the release PR body still looks correct.
 // So whatever this returns is what the reviewer sees on the PR *and* what ships
 // on the Release — identical by construction. That is the whole point.
 //
@@ -43,11 +51,13 @@ const CATEGORIES = [
 export class GitHubScopedChangelogNotes {
   // `octokit` is release-please's own authenticated @octokit/rest client
   // (github.octokit), so methods live at octokit.repos.* / .search.* (no .rest).
-  constructor({octokit, owner, repo, logger = console}) {
+  constructor({octokit, owner, repo, logger = console, now = () => new Date()}) {
     this.octokit = octokit;
     this.owner = owner;
     this.repo = repo;
     this.logger = logger;
+    // Injectable clock for the `## <version> (<date>)` header (tests fix it).
+    this.now = now;
   }
 
   // First NAMED category whose labels intersect this PR's labels; `*` excluded.
@@ -65,6 +75,7 @@ export class GitHubScopedChangelogNotes {
     const {octokit, owner, repo} = this;
     const previousTag = options.previousTag; // e.g. openhands-v0.7.68 (undefined on first release)
     const currentTag = options.currentTag;   // e.g. openhands-v0.7.69
+    const version = options.version;         // e.g. 0.7.69 (bare SemVer; anchors the parse round-trip)
 
     // release-please hands us commits newest-first; GitHub's "What's Changed"
     // lists oldest-first. Reverse so our order matches generate-notes.
@@ -148,6 +159,14 @@ export class GitHubScopedChangelogNotes {
     if (previousTag) {
       lines.push('', `**Full Changelog**: https://github.com/${owner}/${repo}/compare/${previousTag}...${currentTag}`);
     }
-    return lines.join('\n').trim();
+    const body = lines.join('\n').trim();
+
+    // Lead with release-please's `## <version> (<date>)` header — the same line
+    // its stock "github" changelog type prepends (changelog-notes/github.js).
+    // LOAD-BEARING, not cosmetic: it is the anchor extractSingleRelease() needs
+    // to recover these notes from the merged PR body at release time (see the
+    // file header). Without it the published Release body comes out empty.
+    const date = this.now().toLocaleDateString('en-CA');
+    return `## ${version} (${date})\n\n${body}`;
   }
 }
