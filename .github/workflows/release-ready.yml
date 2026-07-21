@@ -385,20 +385,30 @@ jobs:
               core.info(`Cut freeze branch ${branch} at ${freezeSha}.`);
             }
 
-            // 2. Announce on the release PR.
+            // 2. Announce on the release PR. The two cases must read differently:
+            //    claiming "Release frozen" when the branch already existed is
+            //    actively misleading — nothing was frozen, and the PR still gets
+            //    returned to draft below, which looks like "I marked it ready and
+            //    it silently un-readied itself, where is my release?".
             const branchUrl = `${context.serverUrl}/${owner}/${repo}/tree/${branch}`;
-            await github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number: pr.number,
-              body: [
-                `🧊 **Release frozen to \`${branch}\`** at \`${freezeSha.slice(0, 7)}\`.`,
-                '',
-                `release-please will open the release PR on [\`${branch}\`](${branchUrl}) — review, test, and **merge that one** to publish. Commits pushed to \`${pr.base.ref}\` after this point are not part of this release.`,
-                '',
-                `This PR has been returned to draft so it is not merged from the moving \`${pr.base.ref}\` branch; it stays as the preview of the next release.`,
-              ].join('\n'),
-            });
+            const body = created
+              ? [
+                  `🧊 **Release frozen to \`${branch}\`** at \`${freezeSha.slice(0, 7)}\`.`,
+                  '',
+                  `release-please will open the release PR on [\`${branch}\`](${branchUrl}) — review, test, and **merge that one** to publish. Commits pushed to \`${pr.base.ref}\` after this point are not part of this release.`,
+                  '',
+                  `This PR has been returned to draft so it is not merged from the moving \`${pr.base.ref}\` branch; it stays as the preview of the next release.`,
+                ].join('\n')
+              : [
+                  `ℹ️ **Nothing to freeze — [\`${branch}\`](${branchUrl}) already exists.**`,
+                  '',
+                  `This release was already frozen (and may already have shipped). The release PR for \`${releaseName}\` lives on [\`${branch}\`](${branchUrl}), not here — **merge that one**, or check whether it has already been merged.`,
+                  '',
+                  `This PR has still been returned to draft: it is built on the moving \`${pr.base.ref}\` branch, so merging it would publish everything that has landed there since the freeze.`,
+                  '',
+                  `If \`${branch}\` has already shipped, merge it back into \`${pr.base.ref}\` — until you do, release-please keeps re-proposing \`${releaseName}\` here and marking this PR ready will keep landing you back in this comment.`,
+                ].join('\n');
+            await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
 
             // 3. Return the PR to draft (GraphQL; the REST API cannot toggle draft state).
             try {
