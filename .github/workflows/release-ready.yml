@@ -391,9 +391,17 @@ jobs:
             //    returned to draft below, which looks like "I marked it ready and
             //    it silently un-readied itself, where is my release?".
             const branchUrl = `${context.serverUrl}/${owner}/${repo}/tree/${branch}`;
-            const body = created
+            // Hidden marker so a later run can find (and supersede) this comment.
+            // release-please reuses ONE release PR per branch, retitling it as the
+            // proposed version changes — so without this, every freeze leaves
+            // another comment behind on the same PR, each still saying "merge that
+            // one to publish" in the present tense about a release that already
+            // shipped. The version is named in the text for the same reason: the
+            // branch alone (`release/0.3`) doesn't say which cut it was.
+            const FREEZE_MARKER = '<!-- release-actions:freeze-on-ready -->';
+            const body = [FREEZE_MARKER, created
               ? [
-                  `🧊 **Release frozen to \`${branch}\`** at \`${freezeSha.slice(0, 7)}\`.`,
+                  `🧊 **Release ${releaseName} frozen to \`${branch}\`** at \`${freezeSha.slice(0, 7)}\`.`,
                   '',
                   `release-please will open the release PR on [\`${branch}\`](${branchUrl}) — review, test, and **merge that one** to publish. Commits pushed to \`${pr.base.ref}\` after this point are not part of this release.`,
                   '',
@@ -407,7 +415,30 @@ jobs:
                   `This PR has still been returned to draft: it is built on the moving \`${pr.base.ref}\` branch, so merging it would publish everything that has landed there since the freeze.`,
                   '',
                   `If \`${branch}\` has already shipped, merge it back into \`${pr.base.ref}\` — until you do, release-please keeps re-proposing \`${releaseName}\` here and marking this PR ready will keep landing you back in this comment.`,
-                ].join('\n');
+                ].join('\n')].join('\n');
+
+            // Supersede any earlier freeze comment so exactly one — the current
+            // one — is ever on the PR. Deliberately delete-then-create rather
+            // than edit in place: on a long-lived recycled release PR, an edited
+            // comment stays buried at its original timeline position, while the
+            // freeze notice needs to be the most recent thing you see.
+            //
+            // Best-effort: the branch is already cut by this point, so a failure
+            // to tidy up must not fail the freeze.
+            try {
+              const prior = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: pr.number, per_page: 100,
+              });
+              for (const c of prior) {
+                if (c.user?.type === 'Bot' && (c.body || '').includes(FREEZE_MARKER)) {
+                  await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
+                  core.info(`Removed superseded freeze comment ${c.id}.`);
+                }
+              }
+            } catch (e) {
+              core.warning(`Could not remove earlier freeze comments: ${e.message}`);
+            }
+
             await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
 
             // 3. Return the PR to draft (GraphQL; the REST API cannot toggle draft state).
