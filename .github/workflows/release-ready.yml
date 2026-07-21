@@ -399,6 +399,18 @@ jobs:
             // shipped. The version is named in the text for the same reason: the
             // branch alone (`release/0.3`) doesn't say which cut it was.
             const FREEZE_MARKER = '<!-- release-actions:freeze-on-ready -->';
+            // Openers used by earlier versions of this job, before the marker
+            // existed. Without these, comments already sitting on a consumer's
+            // release PR are invisible to the cleanup below and stay there
+            // forever — the marker only helps comments written from now on.
+            // Matched on the distinctive heading, and only on Bot-authored
+            // comments, so a human quoting one is never deleted.
+            const LEGACY_OPENERS = ['🧊 **Release frozen to', '🧊 **Release ', 'ℹ️ **Nothing to freeze'];
+            const isOurFreezeComment = (c) => {
+              if (c.user?.type !== 'Bot') return false;
+              const text = (c.body || '').trimStart();
+              return text.includes(FREEZE_MARKER) || LEGACY_OPENERS.some(o => text.startsWith(o));
+            };
             const body = [FREEZE_MARKER, created
               ? [
                   `🧊 **Release ${releaseName} frozen to \`${branch}\`** at \`${freezeSha.slice(0, 7)}\`.`,
@@ -430,7 +442,7 @@ jobs:
                 owner, repo, issue_number: pr.number, per_page: 100,
               });
               for (const c of prior) {
-                if (c.user?.type === 'Bot' && (c.body || '').includes(FREEZE_MARKER)) {
+                if (isOurFreezeComment(c)) {
                   await github.rest.issues.deleteComment({ owner, repo, comment_id: c.id });
                   core.info(`Removed superseded freeze comment ${c.id}.`);
                 }
