@@ -12,8 +12,14 @@ on:
 jobs:
   release-ready:
     permissions:
-      actions: read # write only if `release-test-workflows` is set
-      contents: read # write only if `release-test-event-type` is set
+      # Required unconditionally, not "only if you set the matching input".
+      # Called-workflow job permissions are validated statically at startup,
+      # before any `if:` gating is evaluated: release-ready.yml's
+      # `release-test-workflows` job declares `actions: write` and its
+      # `release-test-dispatch-event` job declares `contents: write`, so a caller
+      # granting `read` for either dies as `startup_failure` — no jobs, no logs.
+      actions: write
+      contents: write
       issues: write
       pull-requests: write
     secrets: inherit # RELEASE_APP_* + SLACK_BOT_TOKEN
