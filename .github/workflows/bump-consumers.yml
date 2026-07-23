@@ -1,23 +1,11 @@
 name: bump-consumers
 
-# Pins every consumer repo's `uses: OpenHands/release-actions/...@<ref>` to a
-# released tag of THIS repo, and opens a `chore(deps): ...` PR in each one.
+# Pins consumer repos' `uses: OpenHands/release-actions/...@<ref>` to a released
+# tag and opens a `chore(deps):` PR in each.
 #
-# Runs automatically when this repo publishes a release, and can be dispatched
-# manually to pin a specific version, target a subset of repos, or dry-run.
-#
-# Auth: mints the shared release App token (RELEASE_APP_ID /
-# RELEASE_APP_PRIVATE_KEY, already org-level secrets), scoped to one target repo
-# at a time. There is deliberately no GITHUB_TOKEN fallback: GITHUB_TOKEN cannot
-# write to another repo, and a PR it opened would not trigger the target repo's
-# required checks.
-#
-# PERMISSION PREREQUISITE (read before deploying): the refs we rewrite live under
-# .github/workflows/ in the target repo, and an App installation token can only
-# push workflow-file changes if the App has "Workflows: write". The shared
-# release App therefore needs Contents + Pull requests + **Workflows** read/write
-# on every target below (org-wide is fine). Without it the push fails on each
-# target with `refusing to allow a GitHub App to create or update workflow`.
+# Prerequisite: the shared release App needs Contents + Pull requests +
+# **Workflows** read/write on every target, since the refs live under
+# .github/workflows/.
 
 on:
   release:
@@ -25,11 +13,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Tag to pin consumers to (e.g. v0.3.0). Defaults to this repo''s latest published release.'
+        description: 'Tag to pin to (e.g. v0.3.0). Defaults to the latest release.'
         required: false
         type: string
       repos:
-        description: 'Newline- or comma-separated owner/name targets. Defaults to the full consumer list in the workflow env.'
+        description: 'Newline/comma-separated owner/name targets. Defaults to DEFAULT_CONSUMERS.'
         required: false
         type: string
       dry-run:
@@ -38,23 +26,15 @@ on:
         default: false
         type: boolean
 
-# Jobs opt in individually; nothing gets ambient write scope.
 permissions: {}
 
-# One fan-out at a time. Two releases landing back-to-back must not race each
-# other into the same consumer branch. Don't cancel: a running bump should finish.
 concurrency:
   group: bump-consumers
   cancel-in-progress: false
 
 env:
-  # Default fan-out targets: every repo in the org that calls a reusable workflow
-  # from this one. Deliberately NOT auto-discovered — code search misses repos
-  # while its index lags, and a silently short list looks like a successful run.
-  #
-  # Excluded on purpose:
-  #   OpenHands/freeze-on-ready-test  — pins a feature-branch SHA as its whole point.
-  #   OpenHands/release-actions       — this repo; releases itself via local `./` refs.
+  # Excluded on purpose: freeze-on-ready-test (pins a feature-branch SHA by
+  # design) and this repo (uses local `./` refs).
   DEFAULT_CONSUMERS: |
     OpenHands/OpenHands
     OpenHands/OpenHands-Cloud
@@ -70,7 +50,7 @@ env:
 
 jobs:
   plan:
-    # Skip drafts and pre-releases; a manual dispatch is always honoured.
+    # Skip drafts and pre-releases; manual dispatch is always honoured.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (!github.event.release.draft && !github.event.release.prerelease)
@@ -103,9 +83,7 @@ jobs:
             echo "No version given; using latest release: $version"
           fi
 
-          # Reject anything that isn't a plain SemVer tag. Pinning every consumer
-          # in the org to a typo'd or non-existent ref would break each of their
-          # release pipelines at once, so this is a hard gate, not a nicety.
+          # Hard gate: a bad ref would break every consumer's pipeline at once.
           if ! printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "::error::'$version' is not a vX.Y.Z tag" >&2
             exit 1
@@ -167,12 +145,9 @@ jobs:
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # We act on the target repo exclusively via the App token minted below,
-    # never via this workflow's GITHUB_TOKEN, so the job needs no permissions.
+    # Acts on the target repo only via the App token below.
     permissions: {}
     strategy:
-      # One unreachable repo (App not installed, branch protected, ...) must not
-      # strand the other ten.
       fail-fast: false
       max-parallel: 4
       matrix:
@@ -187,8 +162,6 @@ jobs:
           echo "owner=${TARGET%%/*}" >> "$GITHUB_OUTPUT"
           echo "name=${TARGET#*/}" >> "$GITHUB_OUTPUT"
 
-      # Scoped to this one repo: a token that could write to all eleven is a
-      # much worse thing to leak than eleven single-repo tokens.
       - name: Mint GitHub App token (scoped to the target repo)
         id: app-token
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
@@ -212,17 +185,13 @@ jobs:
           TARGET: ${{ matrix.repo }}
         run: |
           set -euo pipefail
-          # Values reach the script through the environment, never through
-          # expression interpolation into the source — a tag name is
-          # attacker-shaped input. (Don't write a literal empty expression in
-          # this block either: `run:` is interpolated before the shell sees it.)
+          # Values arrive via env, never expression interpolation into the source.
           python3 <<'PY'
           import os, pathlib, re
 
           version = os.environ["VERSION"]
 
-          # Anchored on the `uses:` key, so commented-out examples and prose
-          # mentions of release-actions in the same file are left alone.
+          # Anchored on the `uses:` key so commented-out examples are left alone.
           LINE = re.compile(
               r'^(?P<head>\s*uses:\s*)'
               r'(?P<q>["\']?)'
@@ -279,15 +248,10 @@ jobs:
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
           token: ${{ steps.app-token.outputs.token }}
-          # Commit only the workflow files we rewrote — never anything else the
-          # runner may have touched.
           add-paths: .github/workflows
-          # A rolling branch: if a bump PR is still open when the next release
-          # lands, it advances to the newer tag instead of piling up PRs.
+          # Rolling branch: an unmerged bump advances to the newer tag.
           branch: chore/bump-release-actions
           delete-branch: true
-          # Conventional Commit title, so the target repo's own pr-title lint
-          # passes and release-please folds it in under `type: chore`.
           commit-message: 'chore(deps): bump release-actions to ${{ needs.plan.outputs.version }}'
           title: 'chore(deps): bump release-actions to ${{ needs.plan.outputs.version }}'
           labels: automated
@@ -301,7 +265,7 @@ jobs:
             | Refs updated | ${{ steps.rewrite.outputs.count }} |
 
             Opened by the [`bump-consumers`](https://github.com/OpenHands/release-actions/actions/workflows/bump-consumers.yml)
-            workflow in `OpenHands/release-actions`. Review the release notes before merging.
+            workflow in `OpenHands/release-actions`.
 
       - name: Report
         if: ${{ always() && steps.rewrite.outcome == 'success' }}
