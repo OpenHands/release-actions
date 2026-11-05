@@ -1,7 +1,8 @@
 // Library-mode release-please driver.
 //
 // This replaces the googleapis/release-please-action step ONLY so we can inject
-// a custom ChangelogNotes (the action exposes no hook for one). Everything else
+// what the action exposes no hook for: a custom ChangelogNotes, and (opt-in)
+// deleting root `.pr/` review evidence in the release PR commit. Everything else
 // — version bumps, the release PR, the tag, the GitHub Release — is stock
 // release-please via its public Manifest API, so behavior matches the action.
 //
@@ -11,6 +12,7 @@
 import {Manifest, GitHub, registerChangelogNotes} from 'release-please';
 import {appendFileSync} from 'node:fs';
 import {GitHubScopedChangelogNotes} from './github-scoped-notes.mjs';
+import {cleanUpPrArtifacts} from './pr-artifacts.mjs';
 
 function setOutput(name, value) {
   const f = process.env.GITHUB_OUTPUT;
@@ -23,6 +25,7 @@ const [owner, repo] = (process.env.GITHUB_REPOSITORY || '').split('/');
 const targetBranch = process.env.TARGET_BRANCH;
 const configFile = process.env.CONFIG_FILE || 'release-please-config.json';
 const manifestFile = process.env.MANIFEST_FILE || '.release-please-manifest.json';
+const cleanupPrArtifacts = process.env.CLEANUP_PR_ARTIFACTS === 'true';
 
 if (!token || !owner || !repo || !targetBranch) {
   console.error('Missing env: GITHUB_TOKEN, GITHUB_REPOSITORY (owner/repo), TARGET_BRANCH');
@@ -44,6 +47,8 @@ registerChangelogNotes('github-scoped', options =>
   }));
 
 const manifest = await Manifest.fromManifest(github, targetBranch, configFile, manifestFile);
+
+if (cleanupPrArtifacts) cleanUpPrArtifacts({github, manifest, owner, repo, targetBranch});
 
 // 1. Cut any release whose release PR was just merged. createReleases() copies
 //    our GitHub-style notes out of the merged PR body (it does not regenerate

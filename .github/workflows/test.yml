@@ -24,9 +24,15 @@ jobs:
         with:
           node-version: '20'
 
-      # No `npm install`: the module under test has no imports, and the tests use
-      # Node's built-in runner plus a fake GitHub client. `npm test` runs
-      # `node --test`, which exits non-zero on any failure and fails the job.
-      - name: Unit tests
+      # The declared release-please dependency, installed as action.yml installs
+      # it at release time: the `.pr/` cleanup tests drive the real library (and
+      # the runner's git) against a fake GitHub API.
+      - name: Install release-please
+        working-directory: scripts/release-please
+        run: npm install --no-audit --no-fund
+
+      # `npm test` runs `node --test`, which exits non-zero on any failure and
+      # fails the job.
+      - name: Tests
         working-directory: scripts/release-please
         run: npm test

@@ -165,6 +165,31 @@ jobs:
 Each line opens and merges its own release PR independently, and the
 `released: <tag>` back-label is keyed on the tag, so the lines never clash.
 
+## Removing `.pr/` review evidence in the release PR
+
+PRs may carry temporary review evidence (screenshots, videos, design notes) in a
+repository-root `.pr/` directory. To keep it out of releases without a separate
+cleanup PR after every merge, opt in on each `release-please.yml` call:
+
+```yaml
+    uses: OpenHands/release-actions/.github/workflows/release-please.yml@main
+    with:
+      cleanup-pr-artifacts: true
+```
+
+Release PR commits are then built without the root `.pr` entry of the target
+branch (`main` or a `release/**` branch), whether it is a directory, a file or a
+symlink, and release-please never writes `.pr/` paths. Evidence that later
+reaches the target or the release PR branch refreshes the open release PR.
+Evidence stays on product PR branches during review and leaves the target when
+the release PR merges. Nothing is pushed to the target branch, and without a
+release candidate no PR is opened. `.pr-other/` and package-level `.pr/`
+directories are left alone. The release PR's own required checks run as usual.
+
+Each release PR update is one push. A release that changes more than 100 files
+reaches the branch as several commits in that push, because release-please's
+code-suggester commits at most 100 files at a time.
+
 ## Release flow
 
 ### 1. Open a PR against `main`

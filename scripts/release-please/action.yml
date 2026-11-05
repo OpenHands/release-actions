@@ -1,10 +1,11 @@
-name: release-please (GitHub-scoped notes)
+name: release-please (library mode)
 description: >-
-  Library-mode release-please with a custom GitHub-style, path-scoped
-  ChangelogNotes. A drop-in for googleapis/release-please-action whose release PR
-  body AND published Release get identical GitHub-style notes, scoped per package
-  path — the format that action's "github" changelog type can't scope in a
-  monorepo.
+  Library-mode release-please, a drop-in for googleapis/release-please-action
+  that adds what the action can't do: a custom GitHub-style, path-scoped
+  ChangelogNotes (packages opt in with `"changelog-type": "github-scoped"`, so the
+  release PR body AND published Release get identical notes scoped per package
+  path), and opt-in deletion of root `.pr/` review evidence in the release PR
+  commit itself.
 
 inputs:
   token:
@@ -21,6 +22,12 @@ inputs:
   manifest-file:
     description: release-please manifest file path, read from the consumer repo via the API.
     required: true
+  cleanup-pr-artifacts:
+    description: >-
+      "true" to delete the target branch's tracked root `.pr/` entries in every
+      release PR create/refresh commit (see pr-artifacts.mjs).
+    required: false
+    default: 'false'
 
 outputs:
   release_created:
@@ -53,7 +60,7 @@ runs:
       working-directory: ${{ github.action_path }}
       run: npm install --no-audit --no-fund
 
-    - name: Run release-please (custom notes)
+    - name: Run release-please (library mode)
       id: run
       shell: bash
       working-directory: ${{ github.action_path }}
@@ -63,4 +70,5 @@ runs:
         TARGET_BRANCH: ${{ inputs.target-branch }}
         CONFIG_FILE: ${{ inputs.config-file }}
         MANIFEST_FILE: ${{ inputs.manifest-file }}
+        CLEANUP_PR_ARTIFACTS: ${{ inputs.cleanup-pr-artifacts }}
       run: node run.mjs
