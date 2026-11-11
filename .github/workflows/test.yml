@@ -36,3 +36,9 @@ jobs:
       - name: Tests
         working-directory: scripts/release-please
         run: npm test
+
+      # No dependencies to install: the tests drive real Git and a local fake of
+      # the GitHub API.
+      - name: pr-artifacts tests
+        working-directory: scripts/pr-artifacts
+        run: npm test

@@ -1,0 +1,81 @@
+name: pr-artifacts (reusable)
+
+# Reusable workflow: keeps root `.pr/` review evidence off the target branch
+# BEFORE merge. For every PR the caller's event names it:
+#
+#   1. publishes the `pr-artifacts` commit status on the PR head:
+#        success  the PR adds no `.pr/` files
+#        pending  it does; they will be removed once the PR is approved
+#        failure  it does, and it is a fork that disallows maintainer edits
+#      Make the context a required status check and `.pr/` cannot merge.
+#   2. once GitHub reports the PR approved, pushes one commit to the PR branch
+#      that drops the root `.pr` entry (fork branches too, via maintainer
+#      edits). The push fires `synchronize`, so the next run turns the status
+#      green. Pair it with the `fast-path` action so that commit costs no CI.
+#
+# The consumer owns the triggers (see the README). This workflow is safe under
+# `pull_request_target` and `workflow_run` because it never checks out or runs
+# PR code: it reads PR metadata from the API and edits the branch with Git
+# plumbing (fetch, ls-tree, mktree, commit-tree, push) only.
+on:
+  workflow_call:
+    inputs:
+      pull-number:
+        description: Review this PR instead of the one(s) the event names (e.g. from workflow_dispatch).
+        required: false
+        type: string
+        default: ''
+      require-approval:
+        description: Remove `.pr` only once GitHub reports the PR approved.
+        required: false
+        type: boolean
+        default: true
+      status-context:
+        description: Commit status context to publish; make it a required check.
+        required: false
+        type: string
+        default: pr-artifacts
+      committer-name:
+        description: Author and committer name of the removal commit.
+        required: false
+        type: string
+        default: github-actions[bot]
+      committer-email:
+        description: Author and committer email of the removal commit.
+        required: false
+        type: string
+        default: 41898282+github-actions[bot]@users.noreply.github.com
+    secrets:
+      PUSH_TOKEN:
+        description: >-
+          Pushes the removal commit. Not GITHUB_TOKEN (its pushes start no
+          workflows, so required checks would never run on the new head). For
+          fork PRs it must belong to an account with write access here.
+        required: false
+
+# Declared here as the cap; the caller job must grant the same.
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+jobs:
+  pr-artifacts:
+    runs-on: ubuntu-latest
+    # One run per PR at a time, so two events cannot race to push. Sweeps
+    # (schedule / dispatch without a number) share one group.
+    concurrency:
+      group: pr-artifacts-${{ github.repository }}-${{ inputs.pull-number || github.event.pull_request.number || github.event.workflow_run.head_branch || 'sweep' }}
+      cancel-in-progress: false
+    steps:
+      - name: Publish status and remove .pr from approved PRs
+        uses: OpenHands/release-actions/scripts/pr-artifacts@main
+        with:
+          mode: review
+          github-token: ${{ github.token }}
+          push-token: ${{ secrets.PUSH_TOKEN }}
+          pull-number: ${{ inputs.pull-number }}
+          require-approval: ${{ inputs.require-approval }}
+          status-context: ${{ inputs.status-context }}
+          committer-name: ${{ inputs.committer-name }}
+          committer-email: ${{ inputs.committer-email }}

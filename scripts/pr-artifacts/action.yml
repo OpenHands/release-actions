@@ -1,0 +1,90 @@
+name: pr-artifacts
+description: >-
+  Keeps root `.pr/` review evidence off the target branch before merge. `review`
+  publishes the `pr-artifacts` commit status and removes `.pr` from approved PR
+  branches (forks included, when they allow maintainer edits). `fast-path` tells
+  a consumer's CI that the head commit only drops `.pr` from an already-passing
+  parent, so the suite can be skipped.
+
+inputs:
+  mode:
+    description: '`review` or `fast-path`.'
+    required: true
+  github-token:
+    description: >-
+      Token for API reads and, in `review`, for writing the commit status. The
+      caller's `github.token` is enough (`statuses: write`, `pull-requests: read`).
+    required: true
+  push-token:
+    description: >-
+      `review` only. Token that pushes the removal commit. Must NOT be
+      `github.token`: pushes made with it start no workflows, so required checks
+      would never run on the new head. For fork PRs it must belong to an account
+      with write access to this repository (maintainer edits). Without it, the
+      status is still published and nothing is pushed.
+    required: false
+    default: ''
+  pull-number:
+    description: '`review` only. Review this PR instead of the one(s) the event names.'
+    required: false
+    default: ''
+  require-approval:
+    description: '`review` only. Remove `.pr` only once GitHub reports the PR as approved.'
+    required: false
+    default: 'true'
+  status-context:
+    description: '`review` only. Commit status context; make it a required check.'
+    required: false
+    default: pr-artifacts
+  status-target-url:
+    description: '`review` only. Link shown on the commit status.'
+    required: false
+    default: https://github.com/OpenHands/release-actions#removing-pr-review-evidence-before-merge
+  committer-name:
+    description: '`review` only. Author and committer name of the removal commit.'
+    required: false
+    default: github-actions[bot]
+  committer-email:
+    description: '`review` only. Author and committer email of the removal commit.'
+    required: false
+    default: 41898282+github-actions[bot]@users.noreply.github.com
+  check-name:
+    description: '`fast-path` only. The check run that must have succeeded on the parent commit.'
+    required: false
+    default: ''
+  head-sha:
+    description: '`fast-path` only. Commit to judge; defaults to the pull request head.'
+    required: false
+    default: ''
+
+outputs:
+  skip:
+    description: '`fast-path` only. "true" when the head only drops `.pr` from a parent where check-name passed.'
+    value: ${{ steps.run.outputs.skip }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      with:
+        node-version: '20'
+
+    # No dependencies: the script talks to the REST/GraphQL API over fetch and
+    # to Git through plumbing commands only.
+    - name: Run pr-artifacts
+      id: run
+      shell: bash
+      env:
+        MODE: ${{ inputs.mode }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        PUSH_TOKEN: ${{ inputs.push-token }}
+        PULL_NUMBER: ${{ inputs.pull-number }}
+        REQUIRE_APPROVAL: ${{ inputs.require-approval }}
+        STATUS_CONTEXT: ${{ inputs.status-context }}
+        STATUS_TARGET_URL: ${{ inputs.status-target-url }}
+        COMMITTER_NAME: ${{ inputs.committer-name }}
+        COMMITTER_EMAIL: ${{ inputs.committer-email }}
+        CHECK_NAME: ${{ inputs.check-name }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+      run: node "$GITHUB_ACTION_PATH/run.mjs"

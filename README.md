@@ -190,6 +190,115 @@ Each release PR update is one push. A release that changes more than 100 files
 reaches the branch as several commits in that push, because release-please's
 code-suggester commits at most 100 files at a time.
 
+## Removing `.pr/` review evidence before merge
+
+`cleanup-pr-artifacts` keeps `.pr/` out of releases, but evidence still lands on
+`main` with every PR that carries it. `pr-artifacts.yml` removes it from the PR
+branch itself, before merge, so it never reaches the target:
+
+1. It publishes a `pr-artifacts` commit status on every PR head:
+   - **success**: the PR adds no root `.pr/` files;
+   - **pending**: it does, and they will be removed once the PR is approved;
+   - **failure**: it does, and it comes from a fork that disallows
+     maintainer edits, so the bot cannot remove them. The author turns on
+     **Allow edits by maintainers** (or deletes `.pr/`) and pushes again.
+2. Once GitHub reports the PR approved, it pushes one commit to the PR branch
+   that drops the root `.pr` entry, fork branches included. That push fires
+   `synchronize`, the next run turns the status green, and the PR can merge.
+
+Make `pr-artifacts` a required status check and nothing under `.pr/` can merge.
+Evidence stays reviewable until approval, through links pinned to commit SHAs.
+`.pr-other/` and nested `.pr/` directories are left alone.
+
+The workflow never checks out or runs PR code. It reads PR metadata from the
+API and edits the branch with Git plumbing only (fetch, `ls-tree`, `mktree`,
+`commit-tree`, push), and it never force-pushes: if the branch moved, the next
+event retries.
+
+### Callers
+
+```yaml
+# .github/workflows/pr-artifacts.yml
+name: pr-artifacts
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review, auto_merge_enabled]
+  workflow_run: # approvals, relayed by pr-artifacts-review.yml below
+    workflows: [pr-artifacts-review]
+    types: [completed]
+  schedule:
+    - cron: "*/30 * * * *" # backstop: sweeps approved open PRs
+  workflow_dispatch:
+    inputs:
+      pull-number: { required: false, default: "" }
+jobs:
+  pr-artifacts:
+    permissions: { contents: read, pull-requests: read, statuses: write }
+    uses: OpenHands/release-actions/.github/workflows/pr-artifacts.yml@main
+    with:
+      pull-number: ${{ inputs.pull-number || '' }}
+    secrets:
+      PUSH_TOKEN: ${{ secrets.OPENHANDS_BOT_GITHUB_PAT_PUBLIC }}
+```
+
+```yaml
+# .github/workflows/pr-artifacts-review.yml
+# Does nothing itself. A review on a fork PR gets no secrets, so this relay
+# only exists to start pr-artifacts.yml through `workflow_run`, which runs in
+# the base repository with them.
+name: pr-artifacts-review
+on:
+  pull_request_review:
+    types: [submitted]
+permissions: {}
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Review on PR ${{ github.event.pull_request.number }} relayed to pr-artifacts."
+```
+
+`PUSH_TOKEN` must not be `GITHUB_TOKEN`: pushes made with it start no
+workflows, so required checks would never run on the new head. For fork PRs it
+must belong to an account with write access to the repository, because the
+push goes through the fork's **Allow edits by maintainers** permission.
+
+Then, once per repository, add `pr-artifacts` to the required status checks of
+the ruleset protecting the target branch. Leave **Dismiss stale approvals** and
+**Require approval of the most recent push** off: the removal commit is a push
+after approval, and either setting would make the PR need approving again.
+
+### Skipping CI for the removal commit
+
+The removal commit changes nothing but `.pr/`, so re-running the whole suite on
+it is pure cost. The `fast-path` mode of the same action answers whether the
+head commit is exactly its single parent minus the root `.pr` entry **and**
+`check-name` already succeeded on that parent. Gate the expensive steps on it:
+
+```yaml
+jobs:
+  test:
+    name: test-and-build (ubuntu)
+    steps:
+      - id: fast-path
+        uses: OpenHands/release-actions/scripts/pr-artifacts@main
+        with:
+          mode: fast-path
+          github-token: ${{ github.token }}
+          check-name: test-and-build (ubuntu) # this job's own check name
+      - uses: actions/checkout@...
+        if: steps.fast-path.outputs.skip != 'true'
+      # ...every other step gets the same `if:`
+```
+
+The job still runs and reports success under its required name. Any doubt
+(an API error, a merge commit, a change outside `.pr/`, a parent that did not
+pass) leaves `skip` false and the suite runs.
+
+A job-level `if:` is simpler where the job has no matrix: GitHub reports a
+skipped job as successful for required checks. A skipped matrix job is reported
+under its unexpanded name instead, so matrix jobs need the step-level form.
+
 ## Release flow
 
 ### 1. Open a PR against `main`
