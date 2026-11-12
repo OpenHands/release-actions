@@ -1,0 +1,285 @@
+name: bump-consumers
+
+# Pins consumer repos' `uses: OpenHands/release-actions/...@<ref>` to a released
+# tag and opens a `chore(deps):` PR in each.
+#
+# Prerequisite: the shared release App needs Contents + Pull requests +
+# **Workflows** read/write on every target, since the refs live under
+# .github/workflows/.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Tag to pin to (e.g. v0.3.0). Defaults to the latest release.'
+        required: false
+        type: string
+      repos:
+        description: 'Newline/comma-separated owner/name targets. Defaults to DEFAULT_CONSUMERS.'
+        required: false
+        type: string
+      dry-run:
+        description: 'Print the rewritten refs without opening PRs.'
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: bump-consumers
+  cancel-in-progress: false
+
+env:
+  # Excluded on purpose: freeze-on-ready-test (pins a feature-branch SHA by
+  # design) and this repo (uses local `./` refs).
+  DEFAULT_CONSUMERS: |
+    OpenHands/OpenHands
+    OpenHands/OpenHands-Cloud
+    OpenHands/agent-canvas
+    OpenHands/automation
+    OpenHands/extensions
+    OpenHands/integrations-hub
+    OpenHands/plugin-directory
+    OpenHands/release-actions-validation
+    OpenHands/runtime-api
+    OpenHands/service-template
+    OpenHands/typescript-client
+
+jobs:
+  plan:
+    # Skip drafts and pre-releases; manual dispatch is always honoured.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (!github.event.release.draft && !github.event.release.prerelease)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      repos: ${{ steps.targets.outputs.repos }}
+      count: ${{ steps.targets.outputs.count }}
+    steps:
+      - name: Resolve target version
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT" = "release" ]; then
+            version="$RELEASE_TAG"
+          elif [ -n "$INPUT_VERSION" ]; then
+            version="$INPUT_VERSION"
+          else
+            version="$(gh release view --repo "$REPO" --json tagName --jq .tagName)"
+            echo "No version given; using latest release: $version"
+          fi
+
+          # Hard gate: a bad ref would break every consumer's pipeline at once.
+          if ! printf '%s' "$version" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::'$version' is not a vX.Y.Z tag" >&2
+            exit 1
+          fi
+
+          if ! gh api "repos/$REPO/git/ref/tags/$version" >/dev/null 2>&1; then
+            echo "::error::tag '$version' does not exist in $REPO" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build target matrix
+        id: targets
+        env:
+          INPUT_REPOS: ${{ inputs.repos }}
+          DEFAULT_CONSUMERS: ${{ env.DEFAULT_CONSUMERS }}
+        run: |
+          set -euo pipefail
+          python3 <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, re, sys
+
+          raw = os.environ.get("INPUT_REPOS", "").strip() or os.environ["DEFAULT_CONSUMERS"]
+          repos, seen = [], set()
+          for item in re.split(r"[,\n]", raw):
+              item = item.strip()
+              if not item or item in seen:
+                  continue
+              if not re.fullmatch(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+", item):
+                  print(f"::error::'{item}' is not a valid owner/name target", file=sys.stderr)
+                  raise SystemExit(1)
+              seen.add(item)
+              repos.append(item)
+
+          if not repos:
+              print("::error::no target repositories resolved", file=sys.stderr)
+              raise SystemExit(1)
+
+          print(f"repos={json.dumps(repos)}")
+          print(f"count={len(repos)}")
+          PY
+
+      - name: Summary
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+          COUNT: ${{ steps.targets.outputs.count }}
+          REPOS: ${{ steps.targets.outputs.repos }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          {
+            echo "## Bumping consumers to \`$VERSION\`"
+            echo
+            echo "Targets: **$COUNT**${DRY_RUN:+ (dry-run: \`$DRY_RUN\`)}"
+            echo
+            printf '%s' "$REPOS" | python3 -c 'import json,sys; [print(f"- `{r}`") for r in json.load(sys.stdin)]'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  bump:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Acts on the target repo only via the App token below.
+    permissions: {}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        repo: ${{ fromJSON(needs.plan.outputs.repos) }}
+    steps:
+      - name: Parse target repo
+        id: target
+        env:
+          TARGET: ${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          echo "owner=${TARGET%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${TARGET#*/}" >> "$GITHUB_OUTPUT"
+
+      - name: Mint GitHub App token (scoped to the target repo)
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ steps.target.outputs.owner }}
+          repositories: ${{ steps.target.outputs.name }}
+
+      - name: Checkout target repo
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: ${{ matrix.repo }}
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Rewrite release-actions refs
+        id: rewrite
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          TARGET: ${{ matrix.repo }}
+        run: |
+          set -euo pipefail
+          # Values arrive via env, never expression interpolation into the source.
+          python3 <<'PY'
+          import os, pathlib, re
+
+          version = os.environ["VERSION"]
+
+          # Anchored on the `uses:` key so commented-out examples are left alone.
+          LINE = re.compile(
+              r'^(?P<head>\s*uses:\s*)'
+              r'(?P<q>["\']?)'
+              r'(?P<action>OpenHands/release-actions(?:/[^@\s"\']*)?)'
+              r'@(?P<ref>[^\s"\']+)'
+              r'(?P=q)(?P<tail>.*)$'
+          )
+
+          changed, unchanged = [], []
+          for path in sorted(pathlib.Path(".github/workflows").glob("*.y*ml")):
+              text = path.read_text(encoding="utf-8")
+              out = []
+              hit = False
+              for line in text.splitlines(keepends=True):
+                  m = LINE.match(line.rstrip("\n"))
+                  if not m:
+                      out.append(line)
+                      continue
+                  if m["ref"] == version:
+                      unchanged.append(f"{path}: already @{version}")
+                      out.append(line)
+                      continue
+                  eol = "\n" if line.endswith("\n") else ""
+                  out.append(
+                      f'{m["head"]}{m["q"]}{m["action"]}@{version}{m["q"]}{m["tail"]}{eol}'
+                  )
+                  changed.append(f'{path}: @{m["ref"]} -> @{version}')
+                  hit = True
+              if hit:
+                  path.write_text("".join(out), encoding="utf-8")
+
+          for line in changed or unchanged:
+              print(line)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"changed={'true' if changed else 'false'}\n")
+              fh.write(f"count={len(changed)}\n")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as fh:
+              fh.write(f"### `{os.environ['TARGET']}`\n\n")
+              if changed:
+                  fh.write("```\n" + "\n".join(changed) + "\n```\n")
+              else:
+                  fh.write(f"No change — already pinned to `{version}`.\n")
+          PY
+
+      - name: Show diff (dry run)
+        if: ${{ inputs.dry-run && steps.rewrite.outputs.changed == 'true' }}
+        run: git --no-pager diff
+
+      - name: Open pull request
+        id: cpr
+        if: ${{ !inputs.dry-run && steps.rewrite.outputs.changed == 'true' }}
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          add-paths: .github/workflows
+          # Rolling branch: an unmerged bump advances to the newer tag.
+          branch: chore/bump-release-actions
+          delete-branch: true
+          commit-message: 'chore(deps): bump release-actions to ${{ needs.plan.outputs.version }}'
+          title: 'chore(deps): bump release-actions to ${{ needs.plan.outputs.version }}'
+          labels: automated
+          body: |
+            Pins this repo's `uses: OpenHands/release-actions/...` references to
+            **${{ needs.plan.outputs.version }}**.
+
+            |           |                                                                                          |
+            | --------- | ---------------------------------------------------------------------------------------- |
+            | Version   | [`${{ needs.plan.outputs.version }}`](https://github.com/OpenHands/release-actions/releases/tag/${{ needs.plan.outputs.version }}) |
+            | Refs updated | ${{ steps.rewrite.outputs.count }} |
+
+            Opened by the [`bump-consumers`](https://github.com/OpenHands/release-actions/actions/workflows/bump-consumers.yml)
+            workflow in `OpenHands/release-actions`.
+
+      - name: Report
+        if: ${{ always() && steps.rewrite.outcome == 'success' }}
+        env:
+          TARGET: ${{ matrix.repo }}
+          CHANGED: ${{ steps.rewrite.outputs.changed }}
+          URL: ${{ steps.cpr.outputs.pull-request-url }}
+          OP: ${{ steps.cpr.outputs.pull-request-operation }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          if [ "$CHANGED" != "true" ]; then
+            echo "$TARGET: already up to date"
+          elif [ "$DRY_RUN" = "true" ]; then
+            echo "$TARGET: dry run, no PR opened"
+          else
+            echo "$TARGET: PR ${OP}: ${URL}" >> "$GITHUB_STEP_SUMMARY"
+          fi
