@@ -190,6 +190,65 @@ Each release PR update is one push. A release that changes more than 100 files
 reaches the branch as several commits in that push, because release-please's
 code-suggester commits at most 100 files at a time.
 
+## Bumping pins on upstream releases
+
+A repo that pins another repo's release (an SDK in `pyproject.toml`, an npm
+package, a service version in a config file) can call `bump-pins.yml` to keep
+**one pull request** open that moves those pins to the latest published releases.
+The workflow resolves the versions and owns the branch, the commit and the pull
+request; the caller names the packages and gives the command that writes a
+version into its own files.
+
+```yaml
+# .github/workflows/bump-pins.yml
+on:
+  workflow_dispatch:
+    inputs:
+      expect:
+        description: 'Releases to wait for, e.g. "SDK=1.63.0"'
+        required: false
+        type: string
+  schedule:
+    - cron: '17 * * * *'
+jobs:
+  bump-pins:
+    secrets: inherit # RELEASE_APP_ID / RELEASE_APP_PRIVATE_KEY, as for release.yml
+    uses: OpenHands/release-actions/.github/workflows/bump-pins.yml@main
+    with:
+      pins: SDK=pypi:openhands-sdk
+      title: 'fix: bump SDK to {SDK}'
+      expect: ${{ inputs.expect }}
+      uv: true
+      command: |
+        sed -i -E 's/"openhands-sdk==[^"]*"/"openhands-sdk=='"$PIN_SDK"'"/' pyproject.toml
+        uv lock
+```
+
+- **`pins`**: one `NAME=pypi:<package>` or `NAME=npm:<package>` line per pin. Each
+  resolves to the latest stable `X.Y.Z` release (yanked and pre-releases are
+  skipped) and reaches the command as `PIN_<NAME>`. For two pins that must agree,
+  `SDK=pypi:openhands-sdk required-by AUTOMATION` resolves to the version that
+  the `AUTOMATION` pin's release requires with `==`, so the pair moves together
+  and `SDK` waits until `AUTOMATION` has caught up.
+- **`command`**: runs in the repository root on the default branch. Every file it
+  changes is committed. It runs without the App token. Set `uv: true` or
+  `node-version` for the toolchain it needs.
+- **`title`**: the commit subject and pull request title; `{NAME}` becomes that
+  pin's version. Use `fix:` when a release has to follow the bump, because
+  release-please opens no release PR for a `chore:` alone.
+- **The pull request** comes from the rolling branch `bump-pins`: the default
+  branch plus one commit, opened by the release App so its checks run. A run
+  rebuilds the branch only when the files the command changed differ from what
+  the branch holds, so commits pushed to it in the meantime (a fix for a test the
+  bump broke) survive until the pins or the lockfile next change. When the default
+  branch already has the pins, nothing is opened and a leftover branch is deleted.
+- **Triggers** belong to the caller. A schedule alone is enough: each run compares
+  the registries with the default branch. To react at once, the upstream publish
+  job can dispatch the caller with `expect`, and the run then waits (20 minutes by
+  default, `wait-minutes`) until the registry serves that release.
+- **`dry-run: true`** resolves, runs the command and prints the commit, and pushes
+  nothing. Use it for the first run in a repo.
+
 ## Release flow
 
 ### 1. Open a PR against `main`
