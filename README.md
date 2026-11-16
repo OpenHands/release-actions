@@ -238,10 +238,11 @@ jobs:
   release-please opens no release PR for a `chore:` alone.
 - **The pull request** comes from the rolling branch `bump-pins`: the default
   branch plus one commit, opened by the release App so its checks run. A run
-  rebuilds the branch only when the files the command changed differ from what
-  the branch holds, so commits pushed to it in the meantime (a fix for a test the
-  bump broke) survive until the pins or the lockfile next change. When the default
-  branch already has the pins, nothing is opened and a leftover branch is deleted.
+  rebuilds the branch only when the files the command changed, or the files the
+  branch's own bump commit changed, differ from what the branch holds, so commits
+  pushed to it in the meantime (a fix for a test the bump broke) survive until the
+  pins or the lockfile next change. When the default branch already has the pins,
+  nothing is opened and a leftover branch is deleted.
 - **Triggers** belong to the caller. A schedule alone is enough: each run compares
   the registries with the default branch. To react at once, the upstream publish
   job can dispatch the caller with `expect`, and the run then waits (20 minutes by

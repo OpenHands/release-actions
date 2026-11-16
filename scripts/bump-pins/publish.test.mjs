@@ -167,6 +167,24 @@ test('a lockfile change on the base branch rebuilds the branch, so it cannot con
   assert.deepEqual(calls, ['create: fix: bump SDK to 1.63.0', 'update: fix: bump SDK to 1.63.0']);
 });
 
+test('a file the previous bump changed is still compared once the base branch catches up with it', async t => {
+  const {commit, show, calls, run} = setUp(t);
+  commit('main', 'chore: add the extensions pin', {'package.json': 'ext 0.41.0\n'});
+  const withExtensions = ext => (dir, version) => {
+    bump(dir, version);
+    writeFileSync(join(dir, 'package.json'), `ext ${ext}\n`);
+  };
+  await run('1.63.0', {command: withExtensions('0.42.0')});
+  commit(BRANCH, 'fix: adapt a test to the new SDK', {'test_sdk.py': 'assert True\n'});
+  // Extensions move on main by hand, so this run changes only the SDK files.
+  commit('main', 'chore: bump extensions to 0.43.0', {'package.json': 'ext 0.43.0\n'});
+
+  await run('1.63.0', {command: withExtensions('0.43.0')});
+  assert.equal(show(BRANCH, 'package.json'), 'ext 0.43.0');
+  assert.equal(show(BRANCH, 'pyproject.toml'), 'sdk==1.63.0');
+  assert.deepEqual(calls, ['create: fix: bump SDK to 1.63.0', 'update: fix: bump SDK to 1.63.0']);
+});
+
 test('nothing is pushed when the base branch already has the pins', async t => {
   const {exists, calls, run} = setUp(t);
   assert.deepEqual(await run('1.62.0'), {changed: false});

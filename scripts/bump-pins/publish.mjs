@@ -3,7 +3,8 @@
 // for it.
 //
 // The branch is rebuilt (base + one commit, force-pushed) only when the files
-// the command changed differ from what the branch already holds. So a rerun with
+// the command changed, or the files the branch's own bump commit changed,
+// differ from what the branch already holds. So a rerun with
 // the same pins leaves the branch alone, and commits pushed to it meanwhile (a
 // fix for a test the bump broke, a merge of the base branch) survive until the
 // pins or the lockfile next change.
@@ -15,6 +16,22 @@ import {parsePins} from './registry.mjs';
 
 const BOT = {name: 'github-actions[bot]', email: '41898282+github-actions[bot]@users.noreply.github.com'};
 const AUTHOR = {GIT_AUTHOR_NAME: BOT.name, GIT_AUTHOR_EMAIL: BOT.email, GIT_COMMITTER_NAME: BOT.name, GIT_COMMITTER_EMAIL: BOT.email};
+
+const BRANCH_DEPTH = 50;
+
+// The files the newest bump commit on `tip` changed, or undefined when that
+// commit or its parent is outside the fetched history (the branch is then
+// rebuilt). Commits pushed by people are not bump commits, so their files are
+// not compared and the commits survive.
+function bumpedPaths(git, tip) {
+  try {
+    const commit = git('log', '-1', '--first-parent', '--fixed-strings', `--author=${BOT.email}`, '--format=%H', tip);
+    if (!commit) return undefined;
+    return git('diff', '--name-only', '-z', `${commit}~1`, commit).split('\0').filter(Boolean);
+  } catch {
+    return undefined;
+  }
+}
 
 export function renderTitle(template, versions) {
   return template.replace(/\{([^{}]*)\}/g, (placeholder, name) => {
@@ -64,12 +81,18 @@ export async function publish({cwd, branch, title, body, api, remoteEnv = {}, dr
 
   let current = false;
   if (pushed) {
-    remote('fetch', '--quiet', '--depth=1', 'origin', `+${ref}:refs/remotes/origin/${branch}`);
-    try {
-      git('diff', '--quiet', `origin/${branch}`, 'HEAD', '--', ...paths);
-      current = true;
-    } catch {
-      // The branch holds other pins, or a lockfile built on an older base.
+    // Deep enough to reach the bump commit under commits pushed on top of it.
+    remote('fetch', '--quiet', `--depth=${BRANCH_DEPTH}`, 'origin', `+${ref}:refs/remotes/origin/${branch}`);
+    // A file the previous bump changed that this run does not (the base branch
+    // caught up with it) must match too, or the branch keeps that stale pin.
+    const previous = bumpedPaths(git, `origin/${branch}`);
+    if (previous) {
+      try {
+        git('diff', '--quiet', `origin/${branch}`, 'HEAD', '--', ...new Set([...paths, ...previous]));
+        current = true;
+      } catch {
+        // The branch holds other pins, or a lockfile built on an older base.
+      }
     }
   }
   if (dryRun) {
