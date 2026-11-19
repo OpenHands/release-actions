@@ -1,0 +1,88 @@
+name: bump-pins
+description: >-
+  Resolves dependency pins to their latest published release, runs the caller's
+  command to write them into the checked-out repository, and keeps one pull
+  request open with the result. Used by the bump-pins reusable workflow, which
+  owns the token, the checkout and the toolchain.
+
+inputs:
+  token:
+    description: >-
+      GitHub App token used to push the branch and open the pull request. It must
+      come from an App (not GITHUB_TOKEN) so the pull request's checks run.
+    required: true
+  pins:
+    description: One `NAME=<registry>:<package>` line per pin (see registry.mjs).
+    required: true
+  command:
+    description: >-
+      Shell command, run in the repository root with one PIN_<NAME> variable per
+      pin, that writes the versions into the repository. It never sees the token.
+    required: true
+  title:
+    description: Commit subject and pull request title; `{NAME}` is replaced by that pin's version.
+    required: true
+  base:
+    description: Branch the pull request targets. It must be the branch that is checked out.
+    required: true
+  branch:
+    description: Rolling branch the pull request is opened from.
+    required: false
+    default: bump-pins
+  expect:
+    description: >-
+      Optional `NAME=X.Y.Z` lines. The run waits until each of those pins
+      resolves to that release or a newer one.
+    required: false
+    default: ''
+  wait-minutes:
+    description: How long to wait for the `expect` releases before failing.
+    required: false
+    default: '20'
+  dry-run:
+    description: '"true" to resolve, run the command and show the commit without pushing anything.'
+    required: false
+    default: 'false'
+
+outputs:
+  versions:
+    description: JSON object of the resolved pins, e.g. {"SDK":"1.63.0"}.
+    value: ${{ steps.resolve.outputs.versions }}
+  changed:
+    description: '"true" if the pins differ from the base branch.'
+    value: ${{ steps.publish.outputs.changed }}
+  pull-request-url:
+    description: URL of the open pull request (empty when nothing changed or on a dry run).
+    value: ${{ steps.publish.outputs.pull-request-url }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve pins
+      id: resolve
+      shell: bash
+      env:
+        BUMP_PINS: ${{ inputs.pins }}
+        BUMP_EXPECT: ${{ inputs.expect }}
+        BUMP_WAIT_MINUTES: ${{ inputs.wait-minutes }}
+      run: node "${{ github.action_path }}/resolve.mjs"
+
+    # The caller's own code, from its base branch. No token in its environment.
+    - name: Apply pins
+      shell: bash
+      env:
+        BUMP_COMMAND: ${{ inputs.command }}
+      run: bash -euo pipefail -c "$BUMP_COMMAND"
+
+    - name: Open or update the pull request
+      id: publish
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        BUMP_PINS: ${{ inputs.pins }}
+        BUMP_VERSIONS: ${{ steps.resolve.outputs.versions }}
+        BUMP_TITLE: ${{ inputs.title }}
+        BUMP_BASE: ${{ inputs.base }}
+        BUMP_BRANCH: ${{ inputs.branch }}
+        BUMP_DRY_RUN: ${{ inputs.dry-run }}
+      run: node "${{ github.action_path }}/publish.mjs"

@@ -1,0 +1,10 @@
+{
+  "name": "bump-pins",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Opens one pull request that moves a repository's dependency pins to the latest published releases.",
+  "scripts": {
+    "test": "node --test *.test.mjs"
+  }
+}

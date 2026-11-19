@@ -1,6 +1,6 @@
 name: test
 
-# Runs the release-please script unit tests on PRs that touch them.
+# Runs the script unit tests (release-please, bump-pins) on PRs that touch them.
 #
 # Plain `pull_request` (NOT pull_request_target): these tests EXECUTE repo code,
 # so they must run with the PR's read-only token, never the base repo's secrets.
@@ -35,4 +35,10 @@ jobs:
       # fails the job.
       - name: Tests
         working-directory: scripts/release-please
+        run: npm test
+
+      # No dependencies to install: the bump-pins scripts use Node and the
+      # runner's git only.
+      - name: bump-pins tests
+        working-directory: scripts/bump-pins
         run: npm test
